@@ -11,6 +11,17 @@ application {
     mainClass = "com.gateway.ApplicationKt"
 }
 
+tasks.jar {
+    archiveFileName.set("GateWay.jar")
+    manifest {
+        attributes["Main-Class"] = application.mainClass.get()
+    }
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    from(configurations.runtimeClasspath.get().map {
+        if (it.isDirectory) it else zipTree(it)
+    })
+}
+
 repositories {
     mavenCentral()
 }
