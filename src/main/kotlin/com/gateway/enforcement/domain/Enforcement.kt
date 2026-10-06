@@ -48,6 +48,11 @@ object SiteInput {
         return "${uri.scheme.lowercase()}://$renderedHost$renderedPort"
     }
 
+    fun localPort(port: Int): String {
+        require(port in 1..65535) { "Application port must be between 1 and 65535" }
+        return "http://127.0.0.1:$port"
+    }
+
     fun tlsRef(raw: String?): String? = raw?.trim()?.takeIf(String::isNotEmpty)?.let(::hostname)
 }
 

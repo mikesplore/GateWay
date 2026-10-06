@@ -61,12 +61,21 @@ class HostCertificateProvisioner(
         val fullchain = File(certDir, "fullchain.pem")
         val key = File(certDir, "privkey.pem")
         if (fullchain.isFile && key.isFile) return null
-        if (helper.isBlank()) return "TLS certificate is missing for $domain; install it or configure GATEWAY_CERTIFICATE_HELPER"
-        if (email.isBlank() || email.length > 254 || !email.contains('@')) return "GATEWAY_CERTIFICATE_EMAIL is required to request a TLS certificate"
-        if (!File(helper).isAbsolute) return "GATEWAY_CERTIFICATE_HELPER must be an absolute executable path"
-        val result = executeCommand(listOf("sudo", "-n", helper, "ensure", domain, email))
-        if (result != null) return "Certificate helper failed: ${result.take(2000)}"
-        return if (fullchain.isFile && key.isFile) null else "Certificate helper completed but certificate files are missing for $domain"
+        val command = if (helper.isNotBlank()) {
+            if (!File(helper).isAbsolute) return "GATEWAY_CERTIFICATE_HELPER must be an absolute executable path"
+            listOf("sudo", "-n", helper, "ensure", domain, email)
+        } else {
+            val certbot = listOf("/usr/bin/certbot", "/usr/local/bin/certbot").firstOrNull { File(it).canExecute() }
+                ?: return "TLS certificate is missing for $domain; install certbot"
+            if (email.isNotBlank() && (email.length > 254 || !email.contains('@'))) return "GATEWAY_CERTIFICATE_EMAIL is invalid"
+            buildList {
+                addAll(listOf("sudo", "-n", certbot, "certonly", "--nginx", "--cert-name", domain, "-d", domain, "--non-interactive", "--agree-tos"))
+                if (email.isBlank()) add("--register-unsafely-without-email") else addAll(listOf("--email", email))
+            }
+        }
+        val result = executeCommand(command)
+        if (result != null) return "Certificate provisioning failed: ${result.take(2000)}"
+        return if (fullchain.isFile && key.isFile) null else "Certificate provisioner completed but certificate files are missing for $domain"
     }
 }
 
@@ -83,9 +92,9 @@ class HostNginxDriver(
             managedDirectory.mkdirs()
             val host = site.hostname
             val target = File(managedDirectory, "${site.id}.conf")
-            site.tlsRef?.let { domain -> certificateProvisioner.ensure(domain)?.let { error(it) } }
             val conflicts = findConflicts(host, target)
             require(conflicts.isEmpty()) { "Hostname $host conflicts with ${conflicts.joinToString()}" }
+            site.tlsRef?.let { domain -> certificateProvisioner.ensure(domain)?.let { error(it) } }
 
             val staged = File(managedDirectory, ".gateway-stage-${site.id}-${UUID.randomUUID()}")
             val validationLink = File(managedDirectory, "gateway-stage-${UUID.randomUUID()}.conf")

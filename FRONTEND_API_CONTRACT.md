@@ -93,7 +93,7 @@ For the browser dashboard, these routes accept **S** and scope results to the us
 | `GET /api/projects` | — | Array of `{id,siteId,name,billingReference,createdAt}` |
 | `POST /api/projects` | `{name,siteId?,billingReference?}` | `201` project record |
 | `GET /api/sites` | — | Array of site records |
-| `POST /api/sites` | `{hostname,upstreamUrl?,tlsRef?,template?,projectId?}` | `201` site record; queues enforcement apply |
+| `POST /api/sites` | `{hostname,port,projectId}` | `201` site record; derives `http://127.0.0.1:{port}`, uses hostname for TLS, and queues Nginx apply (requires Nginx enabled) |
 | `PUT /api/sites/{siteId}` | `{hostname,upstreamUrl?,tlsRef?,template?,projectId?}` | Updated site record; queues enforcement apply |
 
 Current payment response shape:
@@ -120,7 +120,7 @@ Current site response shape:
   "createdAt": "2026-10-06T11:00:00Z",
   "projectId": "uuid",
   "upstreamUrl": "http://127.0.0.1:5173",
-  "tlsRef": "example.com",
+  "tlsRef": "app.example.com",
   "template": "proxy",
   "entitlementState": "active",
   "stateReason": "payment_succeeded",
