@@ -22,7 +22,107 @@ import java.time.LocalDateTime
 import java.time.ZoneOffset
 import java.util.UUID
 
-class ExposedPaymentStore : PaymentStore, com.gateway.payment.domain.PaymentEventRecorder, com.gateway.enforcement.adapter.SiteEnforcementStore {
+class ExposedPaymentStore : PaymentStore, com.gateway.payment.domain.PaymentEventRecorder, com.gateway.enforcement.adapter.SiteEnforcementStore, com.gateway.payment.domain.HumanAuthStore {
+    override fun hasOwner(): Boolean = transaction {
+        GatewayUsers.selectAll().where { (GatewayUsers.role eq "owner") and GatewayUsers.disabledAt.isNull() }.count() > 0
+    }
+
+    override fun provisionFirstOwner(email: String, displayName: String, passwordHash: String, accountName: String): Boolean = transaction {
+        exec("SELECT pg_advisory_xact_lock(718273641)")
+        if (GatewayUsers.selectAll().where { GatewayUsers.role eq "owner" }.count() > 0) return@transaction false
+        val accountId = UUID.randomUUID()
+        val userId = UUID.randomUUID()
+        val now = LocalDateTime.now(ZoneOffset.UTC)
+        Accounts.insert {
+            it[Accounts.id] = accountId
+            it[Accounts.name] = accountName
+            it[Accounts.email] = email
+            it[Accounts.createdAt] = now
+        }
+        GatewayUsers.insert {
+            it[GatewayUsers.id] = userId
+            it[GatewayUsers.accountId] = accountId
+            it[GatewayUsers.email] = email
+            it[GatewayUsers.displayName] = displayName
+            it[GatewayUsers.role] = "owner"
+            it[GatewayUsers.passwordHash] = passwordHash
+            it[GatewayUsers.createdAt] = now
+        }
+        true
+    }
+
+    override fun findUserForLogin(email: String): Pair<com.gateway.payment.domain.GatewayUser, String?>? = transaction {
+        GatewayUsers.selectAll().where { (GatewayUsers.email eq email) and GatewayUsers.disabledAt.isNull() }.singleOrNull()?.let {
+            it.toGatewayUser() to it[GatewayUsers.passwordHash]
+        }
+    }
+
+    override fun createSession(userId: UUID, tokenHash: String, expiresAt: Instant) = transaction {
+        val now = LocalDateTime.now(ZoneOffset.UTC)
+        GatewayUserSessions.insert {
+            it[GatewayUserSessions.id] = UUID.randomUUID()
+            it[GatewayUserSessions.userId] = userId
+            it[GatewayUserSessions.tokenHash] = tokenHash
+            it[GatewayUserSessions.createdAt] = now
+            it[GatewayUserSessions.expiresAt] = LocalDateTime.ofInstant(expiresAt, ZoneOffset.UTC)
+            it[GatewayUserSessions.revokedAt] = null
+            it[GatewayUserSessions.lastSeenAt] = now
+        }
+        Unit
+    }
+
+    override fun findSession(tokenHash: String): Pair<com.gateway.payment.domain.GatewayUser, Instant>? = transaction {
+        val now = LocalDateTime.now(ZoneOffset.UTC)
+        (GatewayUserSessions innerJoin GatewayUsers).selectAll().where {
+            (GatewayUserSessions.tokenHash eq tokenHash) and GatewayUserSessions.revokedAt.isNull() and
+                (GatewayUserSessions.expiresAt greater now) and GatewayUsers.disabledAt.isNull()
+        }.singleOrNull()?.let { row ->
+            GatewayUserSessions.update({ GatewayUserSessions.id eq row[GatewayUserSessions.id] }) { it[lastSeenAt] = now }
+            row.toGatewayUser() to row[GatewayUserSessions.expiresAt].toInstant(ZoneOffset.UTC)
+        }
+    }
+
+    override fun revokeSession(tokenHash: String) = transaction {
+        GatewayUserSessions.update({ (GatewayUserSessions.tokenHash eq tokenHash) and GatewayUserSessions.revokedAt.isNull() }) {
+            it[revokedAt] = LocalDateTime.now(ZoneOffset.UTC)
+        }
+        Unit
+    }
+
+    override fun createInvite(accountId: UUID, email: String, displayName: String, role: String, inviteHash: String, expiresAt: Instant): com.gateway.payment.domain.GatewayUser = transaction {
+        require(GatewayUsers.selectAll().where { GatewayUsers.email eq email }.count() == 0L) { "A user with this email already exists" }
+        val id = UUID.randomUUID()
+        val now = LocalDateTime.now(ZoneOffset.UTC)
+        GatewayUsers.insert {
+            it[GatewayUsers.id] = id
+            it[GatewayUsers.accountId] = accountId
+            it[GatewayUsers.email] = email
+            it[GatewayUsers.displayName] = displayName
+            it[GatewayUsers.role] = role
+            it[GatewayUsers.inviteTokenHash] = inviteHash
+            it[GatewayUsers.inviteExpiresAt] = LocalDateTime.ofInstant(expiresAt, ZoneOffset.UTC)
+            it[GatewayUsers.createdAt] = now
+        }
+        com.gateway.payment.domain.GatewayUser(id, accountId, email, displayName, role)
+    }
+
+    override fun acceptInvite(inviteHash: String, passwordHash: String): com.gateway.payment.domain.GatewayUser? = transaction {
+        val now = LocalDateTime.now(ZoneOffset.UTC)
+        val row = GatewayUsers.selectAll().where {
+            (GatewayUsers.inviteTokenHash eq inviteHash) and (GatewayUsers.inviteExpiresAt greater now) and GatewayUsers.disabledAt.isNull()
+        }.singleOrNull() ?: return@transaction null
+        GatewayUsers.update({ GatewayUsers.id eq row[GatewayUsers.id] }) {
+            it[GatewayUsers.passwordHash] = passwordHash
+            it[GatewayUsers.inviteTokenHash] = null
+            it[GatewayUsers.inviteExpiresAt] = null
+        }
+        row.toGatewayUser()
+    }
+
+    private fun ResultRow.toGatewayUser() = com.gateway.payment.domain.GatewayUser(
+        this[GatewayUsers.id], this[GatewayUsers.accountId], this[GatewayUsers.email], this[GatewayUsers.displayName], this[GatewayUsers.role]
+    )
+
     override fun createAccount(name: String, email: String?): PaymentAccount = transaction {
         val id = UUID.randomUUID()
         val now = LocalDateTime.now(ZoneOffset.UTC)
@@ -33,6 +133,12 @@ class ExposedPaymentStore : PaymentStore, com.gateway.payment.domain.PaymentEven
             it[Accounts.createdAt] = now
         }
         PaymentAccount(id, name, email, now.toInstant(ZoneOffset.UTC))
+    }
+
+    override fun findAccount(accountId: UUID): PaymentAccount? = transaction {
+        Accounts.selectAll().where { Accounts.id eq accountId }.singleOrNull()?.let {
+            PaymentAccount(it[Accounts.id], it[Accounts.name], it[Accounts.email], it[Accounts.createdAt].toInstant(ZoneOffset.UTC))
+        }
     }
 
     override fun authenticateApiKey(apiKeyHash: String): PaymentAccount? = transaction {

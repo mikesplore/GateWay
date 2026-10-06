@@ -23,8 +23,13 @@ object GatewayConfig {
     val mpesaPasskey: String = setting("MPESA_PASSKEY", "").ifBlank { if (mpesaEnvironment == "sandbox") "bfb279f9aa9bdbcf158e97dd71a467cd2e0c893059b10f78e6b72ada1ed2c919" else "" }
     val mpesaTransactionType: String = setting("MPESA_TRANSACTION_TYPE", "CustomerPayBillOnline")
     val mpesaCallbackToken: String = setting("MPESA_CALLBACK_TOKEN", "")
-    val accountCreationMode: String = setting("ACCOUNT_CREATION_MODE", "open").lowercase()
+    val accountCreationMode: String = setting("ACCOUNT_CREATION_MODE", "disabled").lowercase()
     val opsToken: String = setting("GATEWAY_OPS_TOKEN", "")
+    val bootstrapOwnerEmail: String = setting("GATEWAY_BOOTSTRAP_OWNER_EMAIL", "").trim().lowercase()
+    val bootstrapOwnerPassword: String = setting("GATEWAY_BOOTSTRAP_OWNER_PASSWORD", "")
+    val bootstrapOwnerName: String = setting("GATEWAY_BOOTSTRAP_OWNER_NAME", "Gateway Owner").trim()
+    val bootstrapAccountName: String = setting("GATEWAY_BOOTSTRAP_ACCOUNT_NAME", "Gateway").trim()
+    val authCookieSecure: Boolean = setting("AUTH_COOKIE_SECURE", "true").toBooleanStrictOrNull() ?: true
     val reconciliationBatchSize: Int = setting("RECONCILIATION_BATCH_SIZE", "100").toIntOrNull()?.coerceIn(1, 500) ?: 100
     val publicBaseUrl: String = setting("GATEWAY_PUBLIC_URL", "http://localhost:$port").trimEnd('/')
     val reconciliationIntervalSeconds: Long = setting("RECONCILIATION_INTERVAL_SECONDS", "300").toLongOrNull()?.coerceIn(30, 86400) ?: 300

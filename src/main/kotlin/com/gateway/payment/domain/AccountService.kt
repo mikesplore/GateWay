@@ -17,6 +17,8 @@ class AccountService(private val accounts: AccountStore) {
         return accounts.authenticateApiKey(sha256(apiKey))
     }
 
+    fun account(accountId: java.util.UUID): PaymentAccount? = accounts.findAccount(accountId)
+
     fun listKeys(accountId: java.util.UUID): List<MerchantApiKey> = accounts.listApiKeys(accountId)
 
     fun createKey(accountId: java.util.UUID, name: String): CreatedApiKey {
@@ -48,6 +50,7 @@ data class CreatedAccount(val account: PaymentAccount, val apiKey: String)
 
 interface AccountStore {
     fun createAccount(name: String, email: String?): PaymentAccount
+    fun findAccount(accountId: java.util.UUID): PaymentAccount? = null
     fun accountExists(accountId: java.util.UUID): Boolean
     fun authenticateApiKey(apiKeyHash: String): PaymentAccount?
     fun listApiKeys(accountId: java.util.UUID): List<MerchantApiKey>

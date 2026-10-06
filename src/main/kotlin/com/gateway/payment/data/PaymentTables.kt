@@ -126,3 +126,30 @@ object OperationsAudit : Table("operations_audit") {
     val occurredAt = datetime("occurred_at")
     override val primaryKey = PrimaryKey(id)
 }
+
+object GatewayUsers : Table("gateway_users") {
+    val id = uuid("id")
+    val accountId = uuid("account_id").references(Accounts.id)
+    val email = varchar("email", 320).uniqueIndex()
+    val displayName = varchar("display_name", 200)
+    val role = varchar("role", 32)
+    val passwordHash = varchar("password_hash", 256).nullable()
+    val inviteTokenHash = varchar("invite_token_hash", 64).nullable().uniqueIndex()
+    val inviteExpiresAt = datetime("invite_expires_at").nullable()
+    val createdAt = datetime("created_at")
+    val disabledAt = datetime("disabled_at").nullable()
+    override val primaryKey = PrimaryKey(id)
+    init { index(false, accountId, createdAt) }
+}
+
+object GatewayUserSessions : Table("gateway_user_sessions") {
+    val id = uuid("id")
+    val userId = uuid("user_id").references(GatewayUsers.id)
+    val tokenHash = varchar("token_hash", 64).uniqueIndex()
+    val createdAt = datetime("created_at")
+    val expiresAt = datetime("expires_at")
+    val revokedAt = datetime("revoked_at").nullable()
+    val lastSeenAt = datetime("last_seen_at")
+    override val primaryKey = PrimaryKey(id)
+    init { index(false, userId, expiresAt) }
+}

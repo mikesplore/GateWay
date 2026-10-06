@@ -20,6 +20,8 @@ import com.gateway.payment.domain.PaymentSite
 import com.gateway.payment.domain.PaymentProject
 import com.gateway.plugins.DatabaseFactory
 import com.gateway.payment.domain.ProviderPaymentEvent
+import com.gateway.payment.domain.HumanAuthService
+import com.gateway.payment.domain.GatewayUser
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.Application
 import io.ktor.server.request.receiveText
@@ -42,6 +44,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import java.math.BigDecimal
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 private val store = ExposedPaymentStore()
 private val provider = PaystackProvider()
@@ -50,11 +53,19 @@ private val providers: Map<String, PaymentProvider> = listOf(provider, mpesaProv
 private val paymentService = ProviderPaymentService(store, providers)
 private val eventProcessor = PaymentEventProcessor(store)
 private val accountService = AccountService(store)
+private val humanAuth = HumanAuthService(store)
+private val loginAttempts = ConcurrentHashMap<String, java.util.ArrayDeque<Long>>()
 private val reconciler = PaymentReconciler(store, providers)
 private val eventReplay = ProviderEventReplayService(store, providers)
 private val nginxDriver = HostNginxDriver()
 
 fun Application.configurePaymentRoutes() {
+    val bootstrapEmail = GatewayConfig.bootstrapOwnerEmail
+    val bootstrapPassword = GatewayConfig.bootstrapOwnerPassword
+    if (bootstrapEmail.isNotBlank() || bootstrapPassword.isNotBlank()) {
+        require(bootstrapEmail.isNotBlank() && bootstrapPassword.isNotBlank()) { "Both GATEWAY_BOOTSTRAP_OWNER_EMAIL and GATEWAY_BOOTSTRAP_OWNER_PASSWORD are required" }
+        humanAuth.bootstrapOwner(bootstrapEmail, GatewayConfig.bootstrapOwnerName, bootstrapPassword, GatewayConfig.bootstrapAccountName)
+    }
     val jobs = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     val nginxQueue = NginxApplyQueue(store, nginxDriver, jobs)
     jobs.launch {
@@ -79,6 +90,61 @@ fun Application.configurePaymentRoutes() {
     }
     monitor.subscribe(ApplicationStopped) { jobs.cancel() }
     routing {
+        post("/api/auth/login") {
+            val request = runCatching { call.receive<LoginRequest>() }.getOrNull()
+            if (request == null || request.password.isEmpty() || request.password.length > 256) { call.respond(HttpStatusCode.BadRequest, ApiError("invalid_request", "Email and password are required")); return@post }
+            val remote = call.request.local.remoteHost
+            val now = System.currentTimeMillis()
+            if (loginAttempts.size > 10_000) loginAttempts.entries.removeIf { (_, history) -> synchronized(history) { history.isEmpty() || history.first < now - 60_000 } }
+            val attempts = loginAttempts.computeIfAbsent(remote) { java.util.ArrayDeque() }
+            val rateLimited = synchronized(attempts) {
+                while (attempts.isNotEmpty() && attempts.first < now - 60_000) attempts.removeFirst()
+                if (attempts.size >= 10) true else { attempts.addLast(now); false }
+            }
+            if (rateLimited) { call.respond(HttpStatusCode.TooManyRequests, ApiError("rate_limited", "Too many login attempts; try again shortly")); return@post }
+            val issued = runCatching { humanAuth.login(request.email, request.password) }.getOrNull()
+            if (issued == null) { call.respond(HttpStatusCode.Unauthorized, ApiError("invalid_credentials", "Email or password is incorrect")); return@post }
+            synchronized(attempts) { attempts.clear() }
+            val cookie = buildString {
+                append("gateway_session=${issued.token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=43200")
+                if (GatewayConfig.authCookieSecure) append("; Secure")
+            }
+            call.response.headers.append(io.ktor.http.HttpHeaders.SetCookie, cookie)
+            call.respond(LoginResponse(UserResponse.from(issued.user), issued.expiresAt.toString()))
+        }
+        post("/api/auth/logout") {
+            val token = call.request.cookies["gateway_session"]
+            humanAuth.logout(token)
+            val cookie = "gateway_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0" + if (GatewayConfig.authCookieSecure) "; Secure" else ""
+            call.response.headers.append(io.ktor.http.HttpHeaders.SetCookie, cookie)
+            call.respond(HttpStatusCode.NoContent)
+        }
+        get("/api/auth/session") {
+            val session = humanAuth.session(call.request.cookies["gateway_session"])
+            if (session == null) call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "Sign in is required"))
+            else call.respond(LoginResponse(UserResponse.from(session.first), session.second.toString()))
+        }
+        post("/api/auth/accept-invite") {
+            val request = runCatching { call.receive<AcceptInviteRequest>() }.getOrNull()
+            if (request == null || request.token.isBlank()) { call.respond(HttpStatusCode.BadRequest, ApiError("invalid_request", "Invite token and password are required")); return@post }
+            val user = runCatching { humanAuth.acceptInvite(request.token, request.password) }.getOrNull()
+            if (user == null) call.respond(HttpStatusCode.Conflict, ApiError("invite_invalid", "Invite is invalid or expired"))
+            else call.respond(UserResponse.from(user))
+        }
+        post("/api/ops/users") {
+            val session = humanAuth.session(call.request.cookies["gateway_session"])
+            val expectedHost = call.request.headers["Host"] ?: call.request.local.serverHost
+            val origin = call.request.headers["Origin"]
+            val sameHost = runCatching { java.net.URI(origin).authority.equals(expectedHost, ignoreCase = true) }.getOrDefault(false)
+            if (!sameHost || session == null || session.first.role != "owner") { call.respond(HttpStatusCode.Forbidden, ApiError("forbidden", "Owner authorization is required")); return@post }
+            val request = runCatching { call.receive<CreateUserRequest>() }.getOrNull()
+            if (request == null) { call.respond(HttpStatusCode.BadRequest, ApiError("invalid_request", "Email, display name, and role are required")); return@post }
+            val created = runCatching { humanAuth.invite(session.first.accountId, request.email, request.displayName, request.role) }.getOrElse {
+                call.respond(HttpStatusCode.BadRequest, ApiError("invalid_user", it.message ?: "Unable to invite user")); return@post
+            }
+            store.audit("operator_invited", created.first.id.toString(), "role=${created.first.role};by=${session.first.id}")
+            call.respond(HttpStatusCode.Created, CreatedInviteResponse(UserResponse.from(created.first), created.second, java.time.Instant.now().plusSeconds(86400).toString()))
+        }
         get("/api/health") { call.respond(mapOf("status" to "ok")) }
         get("/api/ready") {
             val databaseReady = runCatching { DatabaseFactory.ready() }.getOrDefault(false)
@@ -99,13 +165,13 @@ fun Application.configurePaymentRoutes() {
         }
 
         get("/api/account/api-keys") {
-            val account = authenticatedAccount(call.request.headers["Authorization"])
+            val account = authenticatedAccount(call.request.headers["Authorization"], humanAuth.session(call.request.cookies["gateway_session"])?.first)
             if (account == null) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "A valid merchant API key is required")); return@get }
             call.respond(accountService.listKeys(account.id).map(MerchantApiKeyResponse::from))
         }
 
         post("/api/account/api-keys") {
-            val account = authenticatedAccount(call.request.headers["Authorization"])
+            val account = authenticatedAccount(call.request.headers["Authorization"], humanAuth.session(call.request.cookies["gateway_session"])?.first)
             if (account == null) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "A valid merchant API key is required")); return@post }
             val request = runCatching { call.receive<CreateApiKeyRequest>() }.getOrElse {
                 call.respond(HttpStatusCode.BadRequest, ApiError("invalid_request", "Invalid API key request")); return@post
@@ -117,7 +183,7 @@ fun Application.configurePaymentRoutes() {
         }
 
         post("/api/account/api-keys/{keyId}/revoke") {
-            val account = authenticatedAccount(call.request.headers["Authorization"])
+            val account = authenticatedAccount(call.request.headers["Authorization"], humanAuth.session(call.request.cookies["gateway_session"])?.first)
             if (account == null) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "A valid merchant API key is required")); return@post }
             val keyId = runCatching { UUID.fromString(call.parameters["keyId"]) }.getOrNull()
             if (keyId == null) { call.respond(HttpStatusCode.BadRequest, ApiError("invalid_api_key_id", "A valid key ID is required")); return@post }
@@ -126,7 +192,7 @@ fun Application.configurePaymentRoutes() {
         }
 
         post("/api/account/api-keys/{keyId}/rotate") {
-            val account = authenticatedAccount(call.request.headers["Authorization"])
+            val account = authenticatedAccount(call.request.headers["Authorization"], humanAuth.session(call.request.cookies["gateway_session"])?.first)
             if (account == null) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "A valid merchant API key is required")); return@post }
             val keyId = runCatching { UUID.fromString(call.parameters["keyId"]) }.getOrNull()
             if (keyId == null) { call.respond(HttpStatusCode.BadRequest, ApiError("invalid_api_key_id", "A valid key ID is required")); return@post }
@@ -144,7 +210,7 @@ fun Application.configurePaymentRoutes() {
                 call.respond(HttpStatusCode.BadRequest, ApiError("invalid_request", "Invalid payment request")); return@post
             }
             val amount = request.amount.toBigDecimalOrNull()
-            val account = authenticatedAccount(call.request.headers["Authorization"])
+            val account = authenticatedAccount(call.request.headers["Authorization"], humanAuth.session(call.request.cookies["gateway_session"])?.first)
             if (account == null) {
                 call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "A valid merchant API key is required")); return@post
             }
@@ -161,7 +227,7 @@ fun Application.configurePaymentRoutes() {
         }
 
         get("/api/payments/{reference}/history") {
-            val account = authenticatedAccount(call.request.headers["Authorization"])
+            val account = authenticatedAccount(call.request.headers["Authorization"], humanAuth.session(call.request.cookies["gateway_session"])?.first)
             if (account == null) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "A valid merchant API key is required")); return@get }
             val payment = store.findByGatewayReference(call.parameters["reference"].orEmpty())?.takeIf { it.accountId == account.id }
             if (payment == null) { call.respond(HttpStatusCode.NotFound, ApiError("payment_not_found", "Payment not found")); return@get }
@@ -169,7 +235,7 @@ fun Application.configurePaymentRoutes() {
         }
 
         get("/api/payments/{reference}") {
-            val account = authenticatedAccount(call.request.headers["Authorization"])
+            val account = authenticatedAccount(call.request.headers["Authorization"], humanAuth.session(call.request.cookies["gateway_session"])?.first)
             if (account == null) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "A valid merchant API key is required")); return@get }
             val reference = call.parameters["reference"].orEmpty()
             val payment = store.findByGatewayReference(reference)?.takeIf { it.accountId == account.id }
@@ -178,7 +244,7 @@ fun Application.configurePaymentRoutes() {
         }
 
         get("/api/payments") {
-            val account = authenticatedAccount(call.request.headers["Authorization"])
+            val account = authenticatedAccount(call.request.headers["Authorization"], humanAuth.session(call.request.cookies["gateway_session"])?.first)
             if (account == null) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "A valid merchant API key is required")); return@get }
             val status = call.request.queryParameters["status"]?.let { runCatching { PaymentStatus.valueOf(it.uppercase()) }.getOrNull() }
             if (call.request.queryParameters["status"] != null && status == null) { call.respond(HttpStatusCode.BadRequest, ApiError("invalid_status", "Unknown payment status")); return@get }
@@ -193,7 +259,7 @@ fun Application.configurePaymentRoutes() {
         }
 
         get("/api/payments/summary") {
-            val account = authenticatedAccount(call.request.headers["Authorization"])
+            val account = authenticatedAccount(call.request.headers["Authorization"], humanAuth.session(call.request.cookies["gateway_session"])?.first)
             if (account == null) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "A valid merchant API key is required")); return@get }
             val total = store.paymentTotals(account.id)
             call.respond(PaymentSummaryResponse(total.count, total.succeededCount, total.pendingCount, total.failedCount, total.reversedCount,
@@ -201,7 +267,7 @@ fun Application.configurePaymentRoutes() {
         }
 
         post("/api/payments/{reference}/reconcile") {
-            val account = authenticatedAccount(call.request.headers["Authorization"])
+            val account = authenticatedAccount(call.request.headers["Authorization"], humanAuth.session(call.request.cookies["gateway_session"])?.first)
             if (account == null) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "A valid merchant API key is required")); return@post }
             val payment = store.findByGatewayReference(call.parameters["reference"].orEmpty())?.takeIf { it.accountId == account.id }
             if (payment == null) { call.respond(HttpStatusCode.NotFound, ApiError("payment_not_found", "Payment not found")); return@post }
@@ -213,7 +279,7 @@ fun Application.configurePaymentRoutes() {
         }
 
         get("/api/ops/payment-events") {
-            if (!authorizedOperations(call.request.headers["Authorization"])) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "Operations authorization required")); return@get }
+            if (!authorizedOperations(call.request.headers["Authorization"], humanAuth.session(call.request.cookies["gateway_session"])?.first)) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "Operations authorization required")); return@get }
             val status = call.request.queryParameters["status"]
             if (status != null && status !in setOf("received", "processed", "failed")) { call.respond(HttpStatusCode.BadRequest, ApiError("invalid_status", "Unknown event status")); return@get }
             val events = store.listEvents(status, call.request.queryParameters["limit"]?.toIntOrNull() ?: 50, call.request.queryParameters["offset"]?.toIntOrNull() ?: 0)
@@ -221,7 +287,7 @@ fun Application.configurePaymentRoutes() {
         }
 
         post("/api/ops/payment-events/{eventId}/replay") {
-            if (!authorizedOperations(call.request.headers["Authorization"])) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "Operations authorization required")); return@post }
+            if (!authorizedOperations(call.request.headers["Authorization"], humanAuth.session(call.request.cookies["gateway_session"])?.first)) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "Operations authorization required")); return@post }
             val id = runCatching { UUID.fromString(call.parameters["eventId"]) }.getOrNull()
             if (id == null) { call.respond(HttpStatusCode.BadRequest, ApiError("invalid_event_id", "A valid event ID is required")); return@post }
             if (!eventReplay.replay(id)) { store.audit("payment_event_replay_failed", id.toString()); call.respond(HttpStatusCode.Conflict, ApiError("event_not_replayable", "Failed event was not found or could not be replayed")); return@post }
@@ -231,7 +297,7 @@ fun Application.configurePaymentRoutes() {
         }
 
         get("/api/ops/payment-events/{eventId}") {
-            if (!authorizedOperations(call.request.headers["Authorization"])) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "Operations authorization required")); return@get }
+            if (!authorizedOperations(call.request.headers["Authorization"], humanAuth.session(call.request.cookies["gateway_session"])?.first)) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "Operations authorization required")); return@get }
             val id = runCatching { UUID.fromString(call.parameters["eventId"]) }.getOrNull()
             if (id == null) { call.respond(HttpStatusCode.BadRequest, ApiError("invalid_event_id", "A valid event ID is required")); return@get }
             val event = store.getEvent(id)
@@ -240,12 +306,12 @@ fun Application.configurePaymentRoutes() {
         }
 
         get("/api/sites") {
-            val account = authenticatedAccount(call.request.headers["Authorization"])
+            val account = authenticatedAccount(call.request.headers["Authorization"], humanAuth.session(call.request.cookies["gateway_session"])?.first)
             if (account == null) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "A valid merchant API key is required")); return@get }
             call.respond(store.listSites(account.id).map(SiteResponse::from))
         }
         post("/api/sites") {
-            val account = authenticatedAccount(call.request.headers["Authorization"])
+            val account = authenticatedAccount(call.request.headers["Authorization"], humanAuth.session(call.request.cookies["gateway_session"])?.first)
             if (account == null) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "A valid merchant API key is required")); return@post }
             val req = runCatching { call.receive<CreateSiteRequest>() }.getOrNull()
             if (req == null) { call.respond(HttpStatusCode.BadRequest, ApiError("invalid_site", "A valid site request is required")); return@post }
@@ -261,7 +327,7 @@ fun Application.configurePaymentRoutes() {
             call.respond(HttpStatusCode.Created, SiteResponse.from(site))
         }
         put("/api/sites/{siteId}") {
-            val account = authenticatedAccount(call.request.headers["Authorization"])
+            val account = authenticatedAccount(call.request.headers["Authorization"], humanAuth.session(call.request.cookies["gateway_session"])?.first)
             if (account == null) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "A valid merchant API key is required")); return@put }
             val id = runCatching { UUID.fromString(call.parameters["siteId"]) }.getOrNull()
             val req = runCatching { call.receive<UpdateSiteRequest>() }.getOrNull()
@@ -281,12 +347,12 @@ fun Application.configurePaymentRoutes() {
             call.respond(SiteResponse.from(site))
         }
         get("/api/projects") {
-            val account = authenticatedAccount(call.request.headers["Authorization"])
+            val account = authenticatedAccount(call.request.headers["Authorization"], humanAuth.session(call.request.cookies["gateway_session"])?.first)
             if (account == null) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "A valid merchant API key is required")); return@get }
             call.respond(store.listProjects(account.id).map(ProjectResponse::from))
         }
         post("/api/projects") {
-            val account = authenticatedAccount(call.request.headers["Authorization"])
+            val account = authenticatedAccount(call.request.headers["Authorization"], humanAuth.session(call.request.cookies["gateway_session"])?.first)
             if (account == null) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "A valid merchant API key is required")); return@post }
             val req = runCatching { call.receive<CreateProjectRequest>() }.getOrNull()
             if (req == null || req.name.isBlank() || req.name.length > 200 || req.billingReference?.length ?: 0 > 128) { call.respond(HttpStatusCode.BadRequest, ApiError("invalid_project", "A valid project name and optional billing reference are required")); return@post }
@@ -297,18 +363,18 @@ fun Application.configurePaymentRoutes() {
         }
 
         get("/api/ops/nginx/configs") {
-            if (!authorizedOperations(call.request.headers["Authorization"])) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "Operations authorization required")); return@get }
+            if (!authorizedOperations(call.request.headers["Authorization"], humanAuth.session(call.request.cookies["gateway_session"])?.first)) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "Operations authorization required")); return@get }
             call.respond(NginxConfigInspectionResponse(GatewayConfig.nginxEnabled, nginxDriver.inspectExternalConfigs(), nginxQueue.orphanedFiles()))
         }
         post("/api/ops/nginx/reconcile") {
-            if (!authorizedOperations(call.request.headers["Authorization"])) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "Operations authorization required")); return@post }
+            if (!authorizedOperations(call.request.headers["Authorization"], humanAuth.session(call.request.cookies["gateway_session"])?.first)) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "Operations authorization required")); return@post }
             val expired = nginxQueue.expireGrace()
             val queued = nginxQueue.reconcile()
             store.audit("nginx_reconcile_requested", null, "grace_expired=$expired, drifted=$queued")
             call.respond(NginxReconcileResponse(if (GatewayConfig.nginxEnabled) "queued" else "disabled", expired, queued, nginxQueue.orphanedFiles()))
         }
         post("/api/ops/nginx/sites/{siteId}/apply") {
-            if (!authorizedOperations(call.request.headers["Authorization"])) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "Operations authorization required")); return@post }
+            if (!authorizedOperations(call.request.headers["Authorization"], humanAuth.session(call.request.cookies["gateway_session"])?.first)) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "Operations authorization required")); return@post }
             val id = runCatching { UUID.fromString(call.parameters["siteId"]) }.getOrNull()
             if (id == null) { call.respond(HttpStatusCode.BadRequest, ApiError("invalid_site_id", "A valid site ID is required")); return@post }
             if (store.findSite(id) == null) { call.respond(HttpStatusCode.NotFound, ApiError("site_not_found", "Site not found")); return@post }
@@ -317,7 +383,7 @@ fun Application.configurePaymentRoutes() {
             call.respond(mapOf("status" to if (GatewayConfig.nginxEnabled) "queued" else "disabled"))
         }
         put("/api/ops/sites/{siteId}/entitlement") {
-            if (!authorizedOperations(call.request.headers["Authorization"])) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "Operations authorization required")); return@put }
+            if (!authorizedOperations(call.request.headers["Authorization"], humanAuth.session(call.request.cookies["gateway_session"])?.first)) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "Operations authorization required")); return@put }
             val id = runCatching { UUID.fromString(call.parameters["siteId"]) }.getOrNull()
             val req = runCatching { call.receive<SetEntitlementRequest>() }.getOrNull()
             val effectiveAt = req?.effectiveAt?.let { runCatching { java.time.Instant.parse(it) }.getOrNull() }
@@ -400,10 +466,12 @@ fun Application.configurePaymentRoutes() {
     }
 }
 
-private fun authenticatedAccount(authorization: String?) =
+private fun authenticatedAccount(authorization: String?, user: GatewayUser? = null) =
     accountService.authenticate(authorization?.takeIf { it.startsWith("Bearer ", ignoreCase = true) }?.substringAfter(' '))
+        ?: user?.takeIf { it.role in setOf("owner", "operator") }?.let { accountService.account(it.accountId) }
 
-private fun authorizedOperations(authorization: String?): Boolean {
+private fun authorizedOperations(authorization: String?, user: GatewayUser? = null): Boolean {
+    if (user?.role in setOf("owner", "operator")) return true
     val expected = GatewayConfig.opsToken.takeIf(String::isNotBlank) ?: return false
     val supplied = authorization?.takeIf { it.startsWith("Bearer ", ignoreCase = true) }?.substringAfter(' ') ?: return false
     return java.security.MessageDigest.isEqual(expected.toByteArray(), supplied.toByteArray())
@@ -421,6 +489,14 @@ private fun redactPayload(provider: String, payload: String): String {
 }
 
 @Serializable data class InitiatePaymentRequest(val email: String = "", val amount: String, val currency: String, val idempotencyKey: String? = null, val provider: String = "paystack", val phoneNumber: String? = null, val projectId: String? = null, val description: String? = null)
+@Serializable data class LoginRequest(val email: String, val password: String)
+@Serializable data class AcceptInviteRequest(val token: String, val password: String)
+@Serializable data class CreateUserRequest(val email: String, val displayName: String, val role: String)
+@Serializable data class UserResponse(val id: String, val email: String, val displayName: String, val role: String, val accountId: String) {
+    companion object { fun from(user: GatewayUser) = UserResponse(user.id.toString(), user.email, user.displayName, user.role, user.accountId.toString()) }
+}
+@Serializable data class LoginResponse(val user: UserResponse, val expiresAt: String)
+@Serializable data class CreatedInviteResponse(val user: UserResponse, val inviteToken: String, val expiresAt: String)
 @Serializable data class CreateAccountRequest(val name: String, val email: String? = null)
 @Serializable data class CreatedAccountResponse(val accountId: String, val name: String, val email: String?, val apiKey: String)
 @Serializable data class CreateApiKeyRequest(val name: String)
