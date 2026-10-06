@@ -1,6 +1,9 @@
 package com.gateway.payment.presentation
 
 import com.gateway.config.GatewayConfig
+import com.gateway.enforcement.adapter.HostNginxDriver
+import com.gateway.enforcement.adapter.NginxApplyQueue
+import com.gateway.enforcement.domain.SiteInput
 import com.gateway.payment.data.ExposedPaymentStore
 import com.gateway.payment.data.PaystackProvider
 import com.gateway.payment.data.MpesaProvider
@@ -24,6 +27,7 @@ import io.ktor.server.request.receive
 import io.ktor.server.response.respond
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
+import io.ktor.server.routing.put
 import io.ktor.server.routing.routing
 import io.ktor.server.application.ApplicationStopped
 import kotlinx.coroutines.CoroutineScope
@@ -48,21 +52,39 @@ private val eventProcessor = PaymentEventProcessor(store)
 private val accountService = AccountService(store)
 private val reconciler = PaymentReconciler(store, providers)
 private val eventReplay = ProviderEventReplayService(store, providers)
+private val nginxDriver = HostNginxDriver()
 
 fun Application.configurePaymentRoutes() {
     val jobs = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    val nginxQueue = NginxApplyQueue(store, nginxDriver, jobs)
+    jobs.launch {
+        runCatching { nginxQueue.expireGrace() }
+        if (GatewayConfig.nginxEnabled) runCatching { nginxQueue.reconcile() }
+    }
     if (System.getenv("RECONCILIATION_ENABLED")?.equals("false", true) != true) jobs.launch {
         while (isActive) {
-            runCatching { reconciler.reconcile(java.time.Instant.now(), GatewayConfig.reconciliationBatchSize) }
+            runCatching {
+                val changed = reconciler.reconcile(java.time.Instant.now(), GatewayConfig.reconciliationBatchSize)
+                if (changed > 0) nginxQueue.enqueueAll()
+            }
             delay(com.gateway.config.GatewayConfig.reconciliationIntervalSeconds * 1000)
+        }
+    }
+    jobs.launch {
+        while (isActive) {
+            runCatching { nginxQueue.expireGrace() }
+            if (GatewayConfig.nginxEnabled) runCatching { nginxQueue.reconcile() }
+            delay(60_000)
         }
     }
     monitor.subscribe(ApplicationStopped) { jobs.cancel() }
     routing {
         get("/api/health") { call.respond(mapOf("status" to "ok")) }
         get("/api/ready") {
-            if (runCatching { DatabaseFactory.ready() }.getOrDefault(false)) call.respond(mapOf("status" to "ready"))
-            else call.respond(HttpStatusCode.ServiceUnavailable, mapOf("status" to "not_ready"))
+            val databaseReady = runCatching { DatabaseFactory.ready() }.getOrDefault(false)
+            val nginxError = nginxDriver.readinessError()
+            if (databaseReady && nginxError == null) call.respond(mapOf("status" to "ready", "database" to "ready", "nginx" to if (GatewayConfig.nginxEnabled) "ready" else "disabled"))
+            else call.respond(HttpStatusCode.ServiceUnavailable, mapOf("status" to "not_ready", "database" to if (databaseReady) "ready" else "not_ready", "nginx" to (nginxError ?: "disabled")))
         }
 
         post("/api/accounts") {
@@ -203,6 +225,7 @@ fun Application.configurePaymentRoutes() {
             val id = runCatching { UUID.fromString(call.parameters["eventId"]) }.getOrNull()
             if (id == null) { call.respond(HttpStatusCode.BadRequest, ApiError("invalid_event_id", "A valid event ID is required")); return@post }
             if (!eventReplay.replay(id)) { store.audit("payment_event_replay_failed", id.toString()); call.respond(HttpStatusCode.Conflict, ApiError("event_not_replayable", "Failed event was not found or could not be replayed")); return@post }
+            nginxQueue.enqueueAll()
             store.audit("payment_event_replayed", id.toString())
             call.respond(ApiMessage("replayed"))
         }
@@ -225,10 +248,37 @@ fun Application.configurePaymentRoutes() {
             val account = authenticatedAccount(call.request.headers["Authorization"])
             if (account == null) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "A valid merchant API key is required")); return@post }
             val req = runCatching { call.receive<CreateSiteRequest>() }.getOrNull()
-            val hostname = req?.hostname?.trim()?.lowercase()?.removePrefix("https://")?.removePrefix("http://")?.trimEnd('/')
-            if (hostname.isNullOrBlank() || hostname.length > 253 || hostname.contains('/') || !hostname.contains('.')) { call.respond(HttpStatusCode.BadRequest, ApiError("invalid_site", "A valid site hostname is required")); return@post }
-            val site = runCatching { store.createSite(account.id, hostname) }.getOrElse { call.respond(HttpStatusCode.Conflict, ApiError("site_creation_failed", it.message ?: "Unable to create site")); return@post }
+            if (req == null) { call.respond(HttpStatusCode.BadRequest, ApiError("invalid_site", "A valid site request is required")); return@post }
+            val hostname = runCatching { SiteInput.hostname(req.hostname.removePrefix("https://").removePrefix("http://").trimEnd('/')) }.getOrNull()
+            val upstream = req.upstreamUrl?.let { runCatching { SiteInput.upstream(it) }.getOrNull() }
+            val tlsRef = runCatching { SiteInput.tlsRef(req.tlsRef) }.getOrNull()
+            val projectId = req.projectId?.let { runCatching { UUID.fromString(it) }.getOrNull() }
+            if (hostname == null || req.upstreamUrl != null && upstream == null || req.tlsRef != null && tlsRef == null || req.projectId != null && projectId == null || req.template != "proxy") {
+                call.respond(HttpStatusCode.BadRequest, ApiError("invalid_site", "Hostname, upstream URL, TLS reference, or template is invalid")); return@post
+            }
+            val site = runCatching { store.createConfiguredSite(account.id, hostname, upstream, tlsRef, req.template, projectId) }.getOrElse { call.respond(HttpStatusCode.Conflict, ApiError("site_creation_failed", it.message ?: "Unable to create site")); return@post }
+            nginxQueue.enqueue(site.id)
             call.respond(HttpStatusCode.Created, SiteResponse.from(site))
+        }
+        put("/api/sites/{siteId}") {
+            val account = authenticatedAccount(call.request.headers["Authorization"])
+            if (account == null) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "A valid merchant API key is required")); return@put }
+            val id = runCatching { UUID.fromString(call.parameters["siteId"]) }.getOrNull()
+            val req = runCatching { call.receive<UpdateSiteRequest>() }.getOrNull()
+            if (id == null || req == null) { call.respond(HttpStatusCode.BadRequest, ApiError("invalid_site", "A valid site ID and site request are required")); return@put }
+            val hostname = runCatching { SiteInput.hostname(req.hostname) }.getOrNull()
+            val upstream = req.upstreamUrl?.let { runCatching { SiteInput.upstream(it) }.getOrNull() }
+            val tls = runCatching { SiteInput.tlsRef(req.tlsRef) }.getOrNull()
+            val projectId = req.projectId?.let { runCatching { UUID.fromString(it) }.getOrNull() }
+            if (hostname == null || req.upstreamUrl != null && upstream == null || req.tlsRef != null && tls == null || req.projectId != null && projectId == null || req.template != "proxy") {
+                call.respond(HttpStatusCode.BadRequest, ApiError("invalid_site", "Hostname, upstream URL, TLS reference, or template is invalid")); return@put
+            }
+            val site = runCatching { store.updateSite(account.id, id, hostname, upstream, tls, req.template, projectId) }.getOrElse {
+                call.respond(HttpStatusCode.Conflict, ApiError("site_update_failed", it.message ?: "Unable to update site")); return@put
+            }
+            if (site == null) { call.respond(HttpStatusCode.NotFound, ApiError("site_not_found", "Site not found")); return@put }
+            nginxQueue.enqueue(id)
+            call.respond(SiteResponse.from(site))
         }
         get("/api/projects") {
             val account = authenticatedAccount(call.request.headers["Authorization"])
@@ -239,11 +289,45 @@ fun Application.configurePaymentRoutes() {
             val account = authenticatedAccount(call.request.headers["Authorization"])
             if (account == null) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "A valid merchant API key is required")); return@post }
             val req = runCatching { call.receive<CreateProjectRequest>() }.getOrNull()
-            if (req == null || req.name.isBlank() || req.name.length > 200 || req.billingReference?.length ?: 0 > 128) { call.respond(HttpStatusCode.BadRequest, ApiError("invalid_project", "A valid project name, site ID, and optional billing reference are required")); return@post }
-            val siteId = runCatching { UUID.fromString(req.siteId) }.getOrNull()
-            if (siteId == null) { call.respond(HttpStatusCode.BadRequest, ApiError("invalid_site_id", "A valid site ID is required")); return@post }
-            val project = runCatching { store.createProject(account.id, siteId, req.name.trim(), req.billingReference?.trim()?.takeIf(String::isNotBlank)) }.getOrElse { call.respond(HttpStatusCode.BadRequest, ApiError("project_creation_failed", it.message ?: "Unable to create project")); return@post }
+            if (req == null || req.name.isBlank() || req.name.length > 200 || req.billingReference?.length ?: 0 > 128) { call.respond(HttpStatusCode.BadRequest, ApiError("invalid_project", "A valid project name and optional billing reference are required")); return@post }
+            val siteId = req.siteId?.let { runCatching { UUID.fromString(it) }.getOrNull() }
+            if (req.siteId != null && siteId == null) { call.respond(HttpStatusCode.BadRequest, ApiError("invalid_site_id", "A valid site ID is required")); return@post }
+            val project = runCatching { store.createGroupedProject(account.id, siteId, req.name.trim(), req.billingReference?.trim()?.takeIf(String::isNotBlank)) }.getOrElse { call.respond(HttpStatusCode.BadRequest, ApiError("project_creation_failed", it.message ?: "Unable to create project")); return@post }
             call.respond(HttpStatusCode.Created, ProjectResponse.from(project))
+        }
+
+        get("/api/ops/nginx/configs") {
+            if (!authorizedOperations(call.request.headers["Authorization"])) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "Operations authorization required")); return@get }
+            call.respond(NginxConfigInspectionResponse(GatewayConfig.nginxEnabled, nginxDriver.inspectExternalConfigs(), nginxQueue.orphanedFiles()))
+        }
+        post("/api/ops/nginx/reconcile") {
+            if (!authorizedOperations(call.request.headers["Authorization"])) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "Operations authorization required")); return@post }
+            val expired = nginxQueue.expireGrace()
+            val queued = nginxQueue.reconcile()
+            store.audit("nginx_reconcile_requested", null, "grace_expired=$expired, drifted=$queued")
+            call.respond(NginxReconcileResponse(if (GatewayConfig.nginxEnabled) "queued" else "disabled", expired, queued, nginxQueue.orphanedFiles()))
+        }
+        post("/api/ops/nginx/sites/{siteId}/apply") {
+            if (!authorizedOperations(call.request.headers["Authorization"])) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "Operations authorization required")); return@post }
+            val id = runCatching { UUID.fromString(call.parameters["siteId"]) }.getOrNull()
+            if (id == null) { call.respond(HttpStatusCode.BadRequest, ApiError("invalid_site_id", "A valid site ID is required")); return@post }
+            if (store.findSite(id) == null) { call.respond(HttpStatusCode.NotFound, ApiError("site_not_found", "Site not found")); return@post }
+            nginxQueue.enqueue(id)
+            store.audit("nginx_site_apply_requested", id.toString())
+            call.respond(mapOf("status" to if (GatewayConfig.nginxEnabled) "queued" else "disabled"))
+        }
+        put("/api/ops/sites/{siteId}/entitlement") {
+            if (!authorizedOperations(call.request.headers["Authorization"])) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "Operations authorization required")); return@put }
+            val id = runCatching { UUID.fromString(call.parameters["siteId"]) }.getOrNull()
+            val req = runCatching { call.receive<SetEntitlementRequest>() }.getOrNull()
+            val effectiveAt = req?.effectiveAt?.let { runCatching { java.time.Instant.parse(it) }.getOrNull() }
+            if (id == null || req == null || req.state !in setOf("active", "grace", "suspended", "disabled_by_admin") || req.reason.isBlank() || req.reason.length > 128 || req.effectiveAt != null && effectiveAt == null || req.state == "grace" && (effectiveAt == null || effectiveAt <= java.time.Instant.now())) {
+                call.respond(HttpStatusCode.BadRequest, ApiError("invalid_entitlement", "State, reason, and future effectiveAt for grace are required")); return@put
+            }
+            if (!store.setEntitlement(id, req.state, req.reason, effectiveAt)) { call.respond(HttpStatusCode.NotFound, ApiError("site_not_found", "Site not found")); return@put }
+            nginxQueue.enqueue(id)
+            store.audit("site_entitlement_changed", id.toString(), "${req.state}:${req.reason}")
+            call.respond(SiteResponse.from(store.findSite(id)!!))
         }
 
         post("/api/payments/paystack/webhook") {
@@ -265,7 +349,7 @@ fun Application.configurePaymentRoutes() {
             val event = decoded.status?.let { com.gateway.payment.domain.ProviderPaymentEvent("paystack", decoded.reference.orEmpty(), it, decoded.amount, decoded.currency, decoded.occurredAt, decoded.providerTransactionId) }
             val record = com.gateway.payment.domain.NewPaymentEvent("paystack", decoded.eventType, decoded.deduplicationKey, decoded.reference, decoded.rawPayload)
             when (eventProcessor.process(record, event)) {
-                EventResult.PROCESSED -> call.respond(HttpStatusCode.OK, WebhookResponse("processed"))
+                EventResult.PROCESSED -> { nginxQueue.enqueueAll(); call.respond(HttpStatusCode.OK, WebhookResponse("processed")) }
                 EventResult.DUPLICATE -> call.respond(HttpStatusCode.OK, WebhookResponse("duplicate"))
                 EventResult.REJECTED -> call.respond(HttpStatusCode.OK, WebhookResponse("rejected"))
             }
@@ -284,7 +368,8 @@ fun Application.configurePaymentRoutes() {
             val event = decoded.status?.let { ProviderPaymentEvent("mpesa", gatewayReference, it, decoded.amount, decoded.currency, decoded.occurredAt, decoded.providerTransactionId) }
             val record = com.gateway.payment.domain.NewPaymentEvent("mpesa", decoded.eventType, decoded.deduplicationKey, gatewayReference, decoded.rawPayload)
             when (eventProcessor.process(record, event)) {
-                EventResult.PROCESSED, EventResult.DUPLICATE -> call.respond(HttpStatusCode.OK, WebhookResponse("accepted"))
+                EventResult.PROCESSED -> { nginxQueue.enqueueAll(); call.respond(HttpStatusCode.OK, WebhookResponse("accepted")) }
+                EventResult.DUPLICATE -> call.respond(HttpStatusCode.OK, WebhookResponse("accepted"))
                 EventResult.REJECTED -> call.respond(HttpStatusCode.OK, WebhookResponse("rejected"))
             }
         }
@@ -307,6 +392,7 @@ fun Application.configurePaymentRoutes() {
                 if (result == EventResult.REJECTED) {
                     call.respond(HttpStatusCode.BadGateway, ApiError("payment_verification_failed", "Verified payment did not match the expected amount and currency")); return@get
                 }
+                if (result == EventResult.PROCESSED) nginxQueue.enqueueAll()
             }
             val refreshed = store.findByGatewayReference(reference) ?: payment
             call.respond(PaymentResponse.from(refreshed))
@@ -362,11 +448,23 @@ private fun redactPayload(provider: String, payload: String): String {
 @Serializable data class PaymentStatusHistoryResponse(val previousStatus: String?, val status: String, val source: String, val providerTransactionId: String?, val occurredAt: String) {
     companion object { fun from(item: com.gateway.payment.domain.PaymentStatusChange) = PaymentStatusHistoryResponse(item.previousStatus?.name?.lowercase(), item.status.name.lowercase(), item.source, item.providerTransactionId, item.occurredAt.toString()) }
 }
-@Serializable data class CreateSiteRequest(val hostname: String)
-@Serializable data class SiteResponse(val id: String, val hostname: String, val createdAt: String) {
-    companion object { fun from(site: PaymentSite) = SiteResponse(site.id.toString(), site.hostname, site.createdAt.toString()) }
+@Serializable data class CreateSiteRequest(val hostname: String, val upstreamUrl: String? = null, val tlsRef: String? = null, val template: String = "proxy", val projectId: String? = null)
+@Serializable data class UpdateSiteRequest(val hostname: String, val upstreamUrl: String? = null, val tlsRef: String? = null, val template: String = "proxy", val projectId: String? = null)
+@Serializable data class SetEntitlementRequest(val state: String, val reason: String, val effectiveAt: String? = null)
+@Serializable data class NginxConfigInspectionResponse(val enabled: Boolean, val externalConfigs: List<com.gateway.enforcement.adapter.ExternalNginxConfig>, val gatewayOrphanedFiles: List<String>)
+@Serializable data class NginxReconcileResponse(val status: String, val graceExpired: Int, val sitesQueued: Int, val gatewayOrphanedFiles: List<String>)
+@Serializable data class SiteResponse(
+    val id: String, val hostname: String, val createdAt: String, val projectId: String?, val upstreamUrl: String?, val tlsRef: String?, val template: String,
+    val entitlementState: String, val stateReason: String, val stateChangedAt: String?, val stateEffectiveAt: String?,
+    val appliedHash: String?, val applyStatus: String, val lastApplyError: String?
+) {
+    companion object { fun from(site: PaymentSite) = SiteResponse(
+        site.id.toString(), site.hostname, site.createdAt.toString(), site.projectId?.toString(), site.upstreamUrl, site.tlsRef, site.template,
+        site.entitlementState, site.stateReason, site.stateChangedAt?.toString(), site.stateEffectiveAt?.toString(),
+        site.appliedHash, site.applyStatus, site.lastApplyError
+    ) }
 }
-@Serializable data class CreateProjectRequest(val siteId: String, val name: String, val billingReference: String? = null)
-@Serializable data class ProjectResponse(val id: String, val siteId: String, val name: String, val billingReference: String?, val createdAt: String) {
-    companion object { fun from(project: PaymentProject) = ProjectResponse(project.id.toString(), project.siteId.toString(), project.name, project.billingReference, project.createdAt.toString()) }
+@Serializable data class CreateProjectRequest(val name: String, val siteId: String? = null, val billingReference: String? = null)
+@Serializable data class ProjectResponse(val id: String, val siteId: String?, val name: String, val billingReference: String?, val createdAt: String) {
+    companion object { fun from(project: PaymentProject) = ProjectResponse(project.id.toString(), project.siteId?.toString(), project.name, project.billingReference, project.createdAt.toString()) }
 }

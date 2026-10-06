@@ -54,8 +54,13 @@ interface PaymentStore : AccountStore {
     fun finishReplayedEvent(eventId: java.util.UUID, event: ProviderPaymentEvent?, error: String?): Boolean
     fun listFailedEvents(limit: Int = 50): List<PaymentEvent>
     fun createSite(accountId: java.util.UUID, hostname: String): PaymentSite
+    fun createConfiguredSite(accountId: java.util.UUID, hostname: String, upstreamUrl: String?, tlsRef: String?, template: String, projectId: java.util.UUID?): PaymentSite = createSite(accountId, hostname)
     fun listSites(accountId: java.util.UUID): List<PaymentSite>
+    fun updateSite(accountId: java.util.UUID, siteId: java.util.UUID, hostname: String, upstreamUrl: String?, tlsRef: String?, template: String, projectId: java.util.UUID?): PaymentSite? = null
+    fun setEntitlement(siteId: java.util.UUID, state: String, reason: String, effectiveAt: java.time.Instant?): Boolean = false
     fun createProject(accountId: java.util.UUID, siteId: java.util.UUID, name: String, billingReference: String?): PaymentProject
+    fun createGroupedProject(accountId: java.util.UUID, siteId: java.util.UUID?, name: String, billingReference: String?): PaymentProject =
+        createProject(accountId, siteId ?: throw IllegalArgumentException("A site ID is required"), name, billingReference)
     fun listProjects(accountId: java.util.UUID): List<PaymentProject>
     fun projectBelongsToAccount(projectId: java.util.UUID, accountId: java.util.UUID): Boolean
     fun recordReconciliationFailure(paymentId: java.util.UUID, error: String, nextAttemptAt: java.time.Instant)

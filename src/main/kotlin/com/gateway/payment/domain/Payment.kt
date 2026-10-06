@@ -104,5 +104,21 @@ interface PaymentProvider {
     suspend fun queryStatus(payment: Payment): Result<ProviderPaymentStatus>
 }
 
-data class PaymentProject(val id: UUID, val accountId: UUID, val siteId: UUID, val name: String, val billingReference: String?, val createdAt: Instant)
-data class PaymentSite(val id: UUID, val accountId: UUID, val hostname: String, val createdAt: Instant)
+data class PaymentProject(val id: UUID, val accountId: UUID, val siteId: UUID?, val name: String, val billingReference: String?, val createdAt: Instant)
+data class PaymentSite(
+    val id: UUID,
+    val accountId: UUID,
+    val hostname: String,
+    val createdAt: Instant,
+    val projectId: UUID? = null,
+    val upstreamUrl: String? = null,
+    val tlsRef: String? = null,
+    val template: String = "proxy",
+    val entitlementState: String = "suspended",
+    val stateReason: String = "awaiting_payment",
+    val stateChangedAt: Instant? = null,
+    val stateEffectiveAt: Instant? = null,
+    val appliedHash: String? = null,
+    val applyStatus: String = "not_configured",
+    val lastApplyError: String? = null
+)

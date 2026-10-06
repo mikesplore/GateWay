@@ -17,4 +17,14 @@ Gateway owns a provider-neutral payment lifecycle. Each adapter implements Gatew
 
 ## Scope limits and prerequisites
 
-The initial M-Pesa channel is STK Push. C2B paybill/till, payouts, refunds, subscriptions, and entitlement enforcement are not included. A real test transaction needs Daraja sandbox credentials and a public HTTPS callback endpoint. Daraja callbacks do not have a universally available HMAC signature like Paystack; Gateway supports a separately configured shared callback token, which should be enforced at the network edge as well.
+The initial M-Pesa channel is STK Push. C2B paybill/till, payouts, refunds, and subscriptions are not included. A real test transaction needs Daraja sandbox credentials and a public HTTPS callback endpoint. Daraja callbacks do not have a universally available HMAC signature like Paystack; Gateway supports a separately configured shared callback token, which should be enforced at the network edge as well.
+
+## Optional host Nginx enforcement follow-on
+
+The payment scope remains independent from site enforcement. The optional Nginx adapter consumes Gateway-owned site configuration and entitlement state:
+
+1. Keep entitlement (`active`, `grace`, `suspended`, `disabled_by_admin`) separate from the derived Nginx action (`proxy` or `payment_page`). Grace expiry goes through the same serialized apply queue.
+2. Render one config per site into a dedicated include directory. Preserve TLS on active and suspended templates. Nginx returns uncached 402 HTML or JSON while suspended.
+3. Serialize and coalesce writes, test the whole Nginx tree before replacement, reload only after validation, restore the prior site file on failure, and reconcile hashes and orphan files.
+4. Verify and deduplicate provider notifications before transactional entitlement changes. Keep app/runtime management, request-time `auth_request`, and Cloudflare out of this adapter.
+5. Migrate one hostname at a time after inspecting its current config and ensuring Gatekeeperd no longer owns it.

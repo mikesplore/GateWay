@@ -14,7 +14,19 @@ object Accounts : Table("accounts") {
 object Sites : Table("sites") {
     val id = uuid("id")
     val accountId = uuid("account_id").references(Accounts.id)
+    // Database FK is declared in V6; omit the Exposed reference to avoid the Sites/Projects init cycle.
+    val projectId = uuid("project_id").nullable()
     val hostname = varchar("hostname", 253)
+    val upstreamUrl = varchar("upstream_url", 2048).nullable()
+    val tlsRef = varchar("tls_ref", 253).nullable()
+    val template = varchar("template", 32).default("proxy")
+    val entitlementState = varchar("entitlement_state", 32).default("suspended")
+    val stateReason = varchar("state_reason", 128).default("awaiting_payment")
+    val stateChangedAt = datetime("state_changed_at").nullable()
+    val stateEffectiveAt = datetime("state_effective_at").nullable()
+    val appliedHash = varchar("applied_hash", 64).nullable()
+    val applyStatus = varchar("apply_status", 32).default("not_configured")
+    val lastApplyError = text("last_apply_error").nullable()
     val createdAt = datetime("created_at")
     override val primaryKey = PrimaryKey(id)
     init { uniqueIndex(accountId, hostname) }
@@ -23,7 +35,7 @@ object Sites : Table("sites") {
 object Projects : Table("projects") {
     val id = uuid("id")
     val accountId = uuid("account_id").references(Accounts.id)
-    val siteId = uuid("site_id").references(Sites.id)
+    val siteId = uuid("site_id").references(Sites.id).nullable()
     val name = varchar("name", 200)
     val billingReference = varchar("billing_reference", 128).nullable()
     val createdAt = datetime("created_at")

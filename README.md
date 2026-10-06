@@ -1,6 +1,6 @@
 # GateWay
 
-GateWay is a lightweight payment processing service. It provides merchant accounts, Paystack and M-Pesa STK Push initiation, provider notifications and verification, PostgreSQL payment/event records, reconciliation, operations APIs, account-scoped payment history, and project/site billing records. Cloudflare enforcement and nginx management are later, separate integrations. GateWay does not manage customer containers or hosting runtimes.
+GateWay is a lightweight payment processing and optional host-Nginx enforcement service. It provides merchant accounts, Paystack and M-Pesa STK Push initiation, provider notifications and verification, PostgreSQL payment/event records, reconciliation, operations APIs, account-scoped payment history, projects that group sites, and entitlement-driven Nginx configs. Cloudflare enforcement is a later adapter. GateWay accepts upstream URLs and does not manage customer containers or hosting runtimes.
 
 ## Stack
 
@@ -11,6 +11,8 @@ GateWay is a lightweight payment processing service. It provides merchant accoun
 ## Configuration
 
 Set `DB_URL`, `DB_USER`, and `DB_PASSWORD` for PostgreSQL. Set `PAYSTACK_SECRET_KEY` to enable Paystack transactions and webhook validation. For M-Pesa, set `MPESA_ENVIRONMENT` (`sandbox` or `production`), `MPESA_CONSUMER_KEY`, `MPESA_CONSUMER_SECRET`, and a high-entropy `MPESA_CALLBACK_TOKEN`. When `MPESA_ENVIRONMENT=sandbox`, Gateway defaults to Safaricom's shared Express sandbox shortcode and passkey (`174379` and the published sandbox passkey); set `MPESA_SHORTCODE` and `MPESA_PASSKEY` explicitly to override them. Production requires the shortcode and passkey associated with the live merchant account. `PORT` defaults to `8080`; `GATEWAY_PUBLIC_URL` must be publicly reachable over HTTPS for provider callbacks in a deployed setup.
+
+Nginx enforcement is disabled by default. See [docs/nginx-enforcement.md](docs/nginx-enforcement.md) for host include, directory and sudo setup, TLS helper contract, project/site flow, migration, and operations APIs. Enable with `NGINX_ENABLED=true` only after configuring the host. The payment core works without Nginx.
 
 Do not run Gradle builds in the sandbox. Build and test GateWay on the host using the existing Gradle cache and ask for host permission before running Gradle.
 
@@ -51,7 +53,7 @@ Configure Paystack to send transaction events to `POST /api/payments/paystack/we
 
 Paystack's browser return URL is `GET /api/payments/paystack/callback`. The callback verifies the reference directly with Paystack, applies a matching successful result idempotently, then returns the current payment status. The webhook remains the normal event path.
 
-`GET /api/health` is a liveness endpoint; `GET /api/ready` checks PostgreSQL connectivity. The database schema is applied automatically through Flyway during startup.
+`GET /api/health` is a liveness endpoint; `GET /api/ready` checks PostgreSQL and, when enabled, Nginx managed-directory readiness. The database schema is applied automatically through Flyway during startup.
 
 ## Payments, operations, and merchant records
 
@@ -59,6 +61,6 @@ Authenticated `GET /api/payments?status=pending&provider=mpesa&currency=KES&proj
 
 Operations APIs use `Authorization: Bearer <GATEWAY_OPS_TOKEN>`: `GET /api/ops/payment-events?status=failed` inspects event metadata, `GET /api/ops/payment-events/{eventId}` returns a redacted payload for troubleshooting, and `POST /api/ops/payment-events/{eventId}/replay` retries through the event's owning provider adapter. Operator inspections and replay attempts are audited.
 
-Merchants can register site records with `POST /api/sites` (`{"hostname":"example.com"}`) and attach projects with `POST /api/projects` (`{"siteId":"...","name":"My project","billingReference":"customer-123"}`). These are account-scoped billing records; they do not enforce access to sites. Entitlements and Cloudflare enforcement remain a later phase.
+Merchants create optional billing-group projects with `POST /api/projects` (`{"name":"My project","billingReference":"customer-123"}`), then create or update sites with hostname, `upstreamUrl`, optional TLS `tlsRef`, and `projectId`. A project can group multiple sites. Verified successful payment events activate linked site entitlements; reversals suspend them. Operations can set `active`, `grace`, `suspended`, or `disabled_by_admin`. With Nginx enabled, GateWay renders active proxy or suspended 402 configs asynchronously. See the [Nginx enforcement guide](docs/nginx-enforcement.md) for setup and migration.
 
-`POST /api/accounts` remains open when `ACCOUNT_CREATION_MODE=open` (development default); set it to `disabled` to prevent public account provisioning in production until an owner/admin onboarding flow exists. `GATEWAY_OPS_TOKEN` enables operations APIs. For Paystack tests, set a test secret and configure its webhook. For Daraja sandbox checks, use your app's consumer credentials, a reachable HTTPS callback URL, and set a random token in `MPESA_CALLBACK_TOKEN`; also restrict callback ingress at the deployment edge. Readiness checks PostgreSQL only. Live-provider integration still requires live shortcode/passkey credentials and a deployed public callback endpoint.
+`POST /api/accounts` remains open when `ACCOUNT_CREATION_MODE=open` (development default); set it to `disabled` to prevent public account provisioning in production until an owner/admin onboarding flow exists. `GATEWAY_OPS_TOKEN` enables operations APIs. For Paystack tests, set a test secret and configure its webhook. For Daraja sandbox checks, use your app's consumer credentials, a reachable HTTPS callback URL, and set a random token in `MPESA_CALLBACK_TOKEN`; also restrict callback ingress at the deployment edge. Live-provider integration still requires live shortcode/passkey credentials and a deployed public callback endpoint.

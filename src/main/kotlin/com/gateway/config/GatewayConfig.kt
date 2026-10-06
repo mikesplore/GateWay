@@ -29,6 +29,16 @@ object GatewayConfig {
     val publicBaseUrl: String = setting("GATEWAY_PUBLIC_URL", "http://localhost:$port").trimEnd('/')
     val reconciliationIntervalSeconds: Long = setting("RECONCILIATION_INTERVAL_SECONDS", "300").toLongOrNull()?.coerceIn(30, 86400) ?: 300
     val reconciliationStaleMinutes: Long = setting("RECONCILIATION_STALE_MINUTES", "10").toLongOrNull()?.coerceIn(1, 10080) ?: 10
+    val nginxEnabled: Boolean = setting("NGINX_ENABLED", "false").toBooleanStrictOrNull() ?: false
+    val nginxManagedDirectory: String = setting("NGINX_MANAGED_DIRECTORY", "/etc/nginx/gateway.d")
+    val nginxConflictDirectories: List<String> = setting("NGINX_CONFLICT_DIRECTORIES", "/etc/nginx/sites-enabled,/etc/nginx/conf.d")
+        .split(',').map(String::trim).filter(String::isNotEmpty)
+    val nginxInspectionDirectories: List<String> = setting("NGINX_INSPECTION_DIRECTORIES", "/etc/nginx/sites-available,/etc/nginx/sites-enabled,/etc/nginx/conf.d")
+        .split(',').map(String::trim).filter(String::isNotEmpty)
+    val nginxExecutable: String = setting("NGINX_EXECUTABLE", "/usr/sbin/nginx")
+    val nginxCertificateDirectory: String = setting("NGINX_CERTIFICATE_DIRECTORY", "/etc/letsencrypt/live")
+    val certificateHelper: String = setting("GATEWAY_CERTIFICATE_HELPER", "")
+    val certificateEmail: String = setting("GATEWAY_CERTIFICATE_EMAIL", "")
 
     val mpesaApiBaseUrl: String = when (mpesaEnvironment) {
         "sandbox" -> "https://sandbox.safaricom.co.ke"

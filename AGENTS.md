@@ -2,7 +2,7 @@
 
 ## Project purpose
 
-GateWay is a lightweight payment gateway management service. Its first implementation phase focuses on payment initiation, provider callbacks/webhooks, payment records, verification, reconciliation, and operational APIs. Cloudflare enforcement is planned for a later phase. Nginx is optional and must not be required by the payment core. Do not add container or application runtime management; Gateway does not need to know which container or hosting process runs a customer application.
+GateWay is a lightweight payment gateway management service. Its first implementation phase focuses on payment initiation, provider callbacks/webhooks, payment records, verification, reconciliation, and operational APIs. Host Nginx enforcement is an optional adapter and must not be required by the payment core. Cloudflare enforcement is planned for a later phase. Do not add container or application runtime management; Gateway accepts an upstream URL and does not need to know which container or hosting process runs a customer application.
 
 ## Stack and version alignment
 
@@ -25,7 +25,7 @@ GateWay is a lightweight payment gateway management service. Its first implement
 - Do not treat a browser redirect as proof of payment; verify with the provider or trusted webhook.
 - Do not store provider secrets in source, logs, or responses.
 - Keep payment processing independent from site enforcement. A successful payment changes Gateway's authoritative billing/entitlement state. Future enforcement adapters can consume that state.
-- Cloudflare Workers/KV and nginx integration are out of scope until explicitly planned as subsequent work.
+- Nginx enforcement consumes authoritative entitlement state through a separate adapter; it must not become a dependency of payment processing. Cloudflare Workers/KV remain out of scope until explicitly planned as subsequent work.
 
 ## Repository hygiene
 
