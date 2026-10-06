@@ -12,6 +12,8 @@ GateWay is a lightweight payment processing and optional host-Nginx enforcement 
 
 Set `DB_URL`, `DB_USER`, and `DB_PASSWORD` for PostgreSQL. Set `PAYSTACK_SECRET_KEY` to enable Paystack transactions and webhook validation. For M-Pesa, set `MPESA_ENVIRONMENT` (`sandbox` or `production`), `MPESA_CONSUMER_KEY`, `MPESA_CONSUMER_SECRET`, and a high-entropy `MPESA_CALLBACK_TOKEN`. When `MPESA_ENVIRONMENT=sandbox`, Gateway defaults to Safaricom's shared Express sandbox shortcode and passkey (`174379` and the published sandbox passkey); set `MPESA_SHORTCODE` and `MPESA_PASSKEY` explicitly to override them. Production requires the shortcode and passkey associated with the live merchant account. `PORT` defaults to `8080`; `GATEWAY_PUBLIC_URL` must be publicly reachable over HTTPS for provider callbacks in a deployed setup.
 
+Configure browser CORS with `CORS_ALLOWED_ORIGINS`, a comma-separated list of exact origins including scheme and optional port (for example, `https://dashboard.example.com`). It defaults to `http://localhost:3000,http://localhost:5173` for local frontend development. Credentials are enabled for cookie-based sessions; do not use `*` as an origin.
+
 Nginx enforcement is disabled by default. See [docs/nginx-enforcement.md](docs/nginx-enforcement.md) for host include, directory and sudo setup, TLS helper contract, project/site flow, migration, and operations APIs. Enable with `NGINX_ENABLED=true` only after configuring the host. The payment core works without Nginx.
 
 ### Dashboard login and initial owner

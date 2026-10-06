@@ -3,6 +3,7 @@ package com.gateway
 import com.gateway.config.GatewayConfig
 import com.gateway.payment.presentation.configurePaymentRoutes
 import com.gateway.plugins.configureDatabase
+import com.gateway.plugins.configureCors
 import com.gateway.plugins.configureMonitoring
 import com.gateway.plugins.configureSerialization
 import io.ktor.server.application.Application
@@ -15,6 +16,7 @@ fun main() {
 }
 
 fun Application.module() {
+    configureCors()
     configureSerialization()
     configureMonitoring()
     configureDatabase()

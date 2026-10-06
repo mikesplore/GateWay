@@ -12,6 +12,8 @@ object GatewayConfig {
 
     val port: Int = setting("PORT", "8080").toIntOrNull()?.takeIf { it in 1..65535 }
         ?: error("PORT must be between 1 and 65535")
+    val corsAllowedOrigins: Set<String> = setting("CORS_ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:5173")
+        .split(',').map(String::trim).filter(String::isNotEmpty).toSet()
     val databaseUrl: String = setting("DB_URL", "jdbc:postgresql://localhost:5432/gateway")
     val databaseUser: String = setting("DB_USER", "gateway")
     val databasePassword: String = setting("DB_PASSWORD", "")
