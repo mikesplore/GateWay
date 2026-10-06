@@ -4,7 +4,7 @@ set -euo pipefail
 # Configuration
 REPO="mikesplore/gateway"
 BRANCH="master"
-TARGET_DIR="/home/ubuntu/gateway/prod"
+TARGET_DIR="/home/ubuntu/gateway/pro"
 JAR_PATH="${TARGET_DIR}/GateWay.jar"
 SERVICE_NAME="gateway"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
