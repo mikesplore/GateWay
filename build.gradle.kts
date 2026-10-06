@@ -1,5 +1,6 @@
 plugins {
     alias(libs.plugins.kotlin.jvm)
+    alias(ktorLibs.plugins.ktor)
     alias(libs.plugins.kotlin.serialization)
     application
 }
@@ -12,14 +13,16 @@ application {
 }
 
 tasks.jar {
+    enabled = false
+}
+
+tasks.withType<com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar>().configureEach {
     archiveFileName.set("GateWay.jar")
     manifest {
         attributes["Main-Class"] = application.mainClass.get()
     }
-    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
-    from(configurations.runtimeClasspath.get().map {
-        if (it.isDirectory) it else zipTree(it)
-    })
+    duplicatesStrategy = DuplicatesStrategy.INCLUDE
+    mergeServiceFiles()
 }
 
 repositories {
