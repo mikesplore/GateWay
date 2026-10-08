@@ -119,7 +119,6 @@ data class PaymentSite(
     val entitlementState: String = "suspended",
     val stateReason: String = "awaiting_payment",
     val billingAmount: BigDecimal = BigDecimal.ZERO,
-    val billingCurrency: String = "KES",
     val manualBlockReason: String? = null,
     val projectStatus: String = "active",
     val projectStatusReason: String? = null,

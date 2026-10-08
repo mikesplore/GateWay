@@ -391,12 +391,11 @@ fun Application.configurePaymentRoutes() {
             val upstream = runCatching { SiteInput.localPort(req.port) }.getOrNull()
             val projectId = req.projectId?.let { runCatching { UUID.fromString(it) }.getOrNull() }
             val billingAmount = req.billingAmount.toBigDecimalOrNull()
-            val billingCurrency = req.billingCurrency.trim().uppercase()
-            if (hostname == null || upstream == null || projectId == null || req.template != "proxy" || !validSiteBilling(billingAmount, billingCurrency)) {
+            if (hostname == null || upstream == null || projectId == null || req.template != "proxy" || !validSiteBilling(billingAmount)) {
                 call.respond(HttpStatusCode.BadRequest, ApiError("invalid_site", "Provide a valid hostname, application port, project, non-negative amount with up to two decimals, and three-letter currency")); return@post
             }
             if (!GatewayConfig.nginxEnabled) { call.respond(HttpStatusCode.Conflict, ApiError("nginx_disabled", "Enable Nginx enforcement before connecting a site")); return@post }
-            val site = runCatching { store.createConfiguredSite(account.id, hostname, upstream, hostname, req.template, projectId, billingAmount!!, billingCurrency) }.getOrElse { call.respond(HttpStatusCode.Conflict, ApiError("site_creation_failed", it.message ?: "Unable to create site")); return@post }
+            val site = runCatching { store.createConfiguredSite(account.id, hostname, upstream, hostname, req.template, projectId, billingAmount!!) }.getOrElse { call.respond(HttpStatusCode.Conflict, ApiError("site_creation_failed", it.message ?: "Unable to create site")); return@post }
             nginxQueue.enqueue(site.id)
             call.respond(HttpStatusCode.Created, SiteResponse.from(site))
         }
@@ -411,11 +410,10 @@ fun Application.configurePaymentRoutes() {
             val tls = runCatching { SiteInput.tlsRef(req.tlsRef) }.getOrNull()
             val projectId = req.projectId?.let { runCatching { UUID.fromString(it) }.getOrNull() }
             val billingAmount = req.billingAmount?.toBigDecimalOrNull()
-            val billingCurrency = req.billingCurrency?.trim()?.uppercase()
-            if (hostname == null || req.upstreamUrl != null && upstream == null || req.tlsRef != null && tls == null || req.projectId != null && projectId == null || req.template != "proxy" || billingAmount != null && !validSiteBilling(billingAmount, billingCurrency ?: "KES") || billingCurrency != null && !validSiteCurrency(billingCurrency)) {
+            if (hostname == null || req.upstreamUrl != null && upstream == null || req.tlsRef != null && tls == null || req.projectId != null && projectId == null || req.template != "proxy" || billingAmount != null && !validSiteBilling(billingAmount)) {
                 call.respond(HttpStatusCode.BadRequest, ApiError("invalid_site", "Hostname, upstream URL, TLS reference, or template is invalid")); return@put
             }
-            val site = runCatching { store.updateSite(account.id, id, hostname, upstream, tls, req.template, projectId, billingAmount, billingCurrency) }.getOrElse {
+            val site = runCatching { store.updateSite(account.id, id, hostname, upstream, tls, req.template, projectId, billingAmount) }.getOrElse {
                 call.respond(HttpStatusCode.Conflict, ApiError("site_update_failed", it.message ?: "Unable to update site")); return@put
             }
             if (site == null) { call.respond(HttpStatusCode.NotFound, ApiError("site_not_found", "Site not found")); return@put }
@@ -639,8 +637,8 @@ private fun redactPayload(provider: String, payload: String): String {
 @Serializable data class PaymentStatusHistoryResponse(val previousStatus: String?, val status: String, val source: String, val providerTransactionId: String?, val occurredAt: String) {
     companion object { fun from(item: com.gateway.payment.domain.PaymentStatusChange) = PaymentStatusHistoryResponse(item.previousStatus?.name?.lowercase(), item.status.name.lowercase(), item.source, item.providerTransactionId, item.occurredAt.toString()) }
 }
-@Serializable data class CreateSiteRequest(val hostname: String, val port: Int, val projectId: String, val template: String = "proxy", val billingAmount: String = "0", val billingCurrency: String = "KES")
-@Serializable data class UpdateSiteRequest(val hostname: String, val upstreamUrl: String? = null, val tlsRef: String? = null, val template: String = "proxy", val projectId: String? = null, val billingAmount: String? = null, val billingCurrency: String? = null)
+@Serializable data class CreateSiteRequest(val hostname: String, val port: Int, val projectId: String, val template: String = "proxy", val billingAmount: String = "0")
+@Serializable data class UpdateSiteRequest(val hostname: String, val upstreamUrl: String? = null, val tlsRef: String? = null, val template: String = "proxy", val projectId: String? = null, val billingAmount: String? = null)
 @Serializable data class SetSiteBlockRequest(val reason: String? = null)
 @Serializable data class SetEntitlementRequest(val state: String, val reason: String, val effectiveAt: String? = null)
 @Serializable data class NginxConfigInspectionResponse(val enabled: Boolean, val externalConfigs: List<com.gateway.enforcement.adapter.ExternalNginxConfig>, val gatewayOrphanedFiles: List<String>)
@@ -649,12 +647,12 @@ private fun redactPayload(provider: String, payload: String): String {
     val id: String, val hostname: String, val createdAt: String, val projectId: String?, val upstreamUrl: String?, val tlsRef: String?, val template: String,
     val entitlementState: String, val stateReason: String, val stateChangedAt: String?, val stateEffectiveAt: String?,
     val appliedHash: String?, val applyStatus: String, val lastApplyError: String?,
-    val billingAmount: String = "0.00", val billingCurrency: String = "KES", val manualBlockReason: String? = null
+    val billingAmount: String = "0.00", val manualBlockReason: String? = null
 ) {
     companion object { fun from(site: PaymentSite) = SiteResponse(
         site.id.toString(), site.hostname, site.createdAt.toString(), site.projectId?.toString(), site.upstreamUrl, site.tlsRef, site.template,
         site.effectiveEntitlementState, site.effectiveStateReason, site.stateChangedAt?.toString(), site.stateEffectiveAt?.toString(),
-        site.appliedHash, site.applyStatus, site.lastApplyError, site.billingAmount.toPlainString(), site.billingCurrency, site.manualBlockReason
+        site.appliedHash, site.applyStatus, site.lastApplyError, site.billingAmount.toPlainString(), site.manualBlockReason
     ) }
 }
 @Serializable data class CreateProjectRequest(val name: String, val siteId: String? = null, val billingReference: String? = null)
@@ -669,8 +667,6 @@ private fun redactPayload(provider: String, payload: String): String {
 @Serializable data class UpdateCustomerRequest(val displayName: String?)
 @Serializable data class UpdateProjectStatusRequest(val status: String, val reason: String? = null)
 
-private fun validSiteBilling(amount: java.math.BigDecimal?, currency: String): Boolean =
+private fun validSiteBilling(amount: java.math.BigDecimal?): Boolean =
     amount != null && amount >= java.math.BigDecimal.ZERO && amount <= java.math.BigDecimal("999999999999.99") &&
-        amount.scale().coerceAtLeast(0) <= 2 && validSiteCurrency(currency)
-
-private fun validSiteCurrency(currency: String): Boolean = currency.matches(Regex("[A-Z]{3}"))
+        amount.scale().coerceAtLeast(0) <= 2

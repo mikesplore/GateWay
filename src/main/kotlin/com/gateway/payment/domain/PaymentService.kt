@@ -55,10 +55,10 @@ interface PaymentStore : AccountStore {
     fun finishReplayedEvent(eventId: java.util.UUID, event: ProviderPaymentEvent?, error: String?): Boolean
     fun listFailedEvents(limit: Int = 50): List<PaymentEvent>
     fun createSite(accountId: java.util.UUID, hostname: String): PaymentSite
-    fun createConfiguredSite(accountId: java.util.UUID, hostname: String, upstreamUrl: String?, tlsRef: String?, template: String, projectId: java.util.UUID?, billingAmount: java.math.BigDecimal = java.math.BigDecimal.ZERO, billingCurrency: String = "KES"): PaymentSite = createSite(accountId, hostname)
+    fun createConfiguredSite(accountId: java.util.UUID, hostname: String, upstreamUrl: String?, tlsRef: String?, template: String, projectId: java.util.UUID?, billingAmount: java.math.BigDecimal = java.math.BigDecimal.ZERO): PaymentSite = createSite(accountId, hostname)
     fun listSites(accountId: java.util.UUID): List<PaymentSite>
     fun deleteSite(accountId: java.util.UUID, siteId: java.util.UUID): Boolean = false
-    fun updateSite(accountId: java.util.UUID, siteId: java.util.UUID, hostname: String, upstreamUrl: String?, tlsRef: String?, template: String, projectId: java.util.UUID?, billingAmount: java.math.BigDecimal? = null, billingCurrency: String? = null): PaymentSite? = null
+    fun updateSite(accountId: java.util.UUID, siteId: java.util.UUID, hostname: String, upstreamUrl: String?, tlsRef: String?, template: String, projectId: java.util.UUID?, billingAmount: java.math.BigDecimal? = null): PaymentSite? = null
     fun setEntitlement(siteId: java.util.UUID, state: String, reason: String, effectiveAt: java.time.Instant?): Boolean = false
     fun setManualSiteBlock(accountId: java.util.UUID, siteId: java.util.UUID, reason: String?): Boolean = false
     fun createProject(accountId: java.util.UUID, siteId: java.util.UUID, name: String, billingReference: String?): PaymentProject
