@@ -466,14 +466,22 @@ class ExposedPaymentStore : PaymentStore, com.gateway.payment.domain.PaymentEven
         val hasOutstandingBalance = nextAmount > paid
         val existingReason = existing[Sites.stateReason]
         val paymentManagedState = existingReason == "awaiting_payment" || existingReason == "no_charge" || existingReason.startsWith("payment_succeeded:") || existingReason.startsWith("payment_reversed:")
+        if (billingAmount != null && nextAmount.compareTo(existing[Sites.billingAmount]) != 0) {
+            val openPayment = Payments.selectAll().where {
+                (Payments.siteId eq siteId) and (Payments.status inList listOf("initializing", "pending"))
+            }.count()
+            require(openPayment == 0L) { "A site payment is in progress; wait for the provider result before changing the site charge" }
+        }
         val changed = Sites.update({ (Sites.id eq siteId) and (Sites.accountId eq accountId) }) {
             it[Sites.projectId] = projectId; it[Sites.hostname] = hostname; it[Sites.upstreamUrl] = upstreamUrl; it[Sites.tlsRef] = tlsRef; it[Sites.template] = template
             it[Sites.billingAmount] = nextAmount
-            if (billingAmount != null && paymentManagedState && existing[Sites.manualBlockReason] == null && existing[Sites.entitlementState] != "disabled_by_admin") {
+            if (billingAmount != null && existing[Sites.manualBlockReason] == null && existing[Sites.entitlementState] != "disabled_by_admin" && (existing[Sites.entitlementState] != "suspended" || paymentManagedState)) {
                 if (hasOutstandingBalance) {
                     it[Sites.entitlementState] = "suspended"; it[Sites.stateReason] = "awaiting_payment"; it[Sites.stateEffectiveAt] = LocalDateTime.now(ZoneOffset.UTC)
+                    it[Sites.stateChangedAt] = LocalDateTime.now(ZoneOffset.UTC)
                 } else {
                     it[Sites.entitlementState] = "active"; it[Sites.stateReason] = if (nextAmount == BigDecimal.ZERO) "no_charge" else "payment_succeeded:site_balance"; it[Sites.stateEffectiveAt] = null
+                    it[Sites.stateChangedAt] = LocalDateTime.now(ZoneOffset.UTC)
                 }
             }
             it[Sites.applyStatus] = nextApplyStatus(); it[Sites.lastApplyError] = null
