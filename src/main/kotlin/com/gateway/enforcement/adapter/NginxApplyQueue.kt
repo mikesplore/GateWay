@@ -261,21 +261,24 @@ class NginxApplyQueue(
 
     fun removeSite(accountId: UUID, siteId: UUID): Result<Unit> = synchronized(siteLocks.computeIfAbsent(siteId) { Any() }) {
         if (!removing.add(siteId)) return@synchronized Result.failure(IllegalStateException("Site removal is already in progress"))
-        val result = driver.removeManaged(siteId).fold(
-            onSuccess = {
-                if (store.deleteSite(accountId, siteId)) Result.success(Unit)
-                else Result.failure(NoSuchElementException("Site not found"))
-            },
-            onFailure = { Result.failure(it) }
-        )
-        removing.remove(siteId)
-        queued.remove(siteId)
-        dirty.remove(siteId)
-        if (result.isFailure && store.findSite(siteId) != null) enqueue(siteId)
-        result
+        try {
+            val result = driver.removeManaged(siteId).fold(
+                onSuccess = {
+                    if (store.deleteSite(accountId, siteId)) Result.success(Unit)
+                    else Result.failure(NoSuchElementException("Site not found"))
+                },
+                onFailure = { Result.failure(it) }
+            )
+            queued.remove(siteId)
+            dirty.remove(siteId)
+            if (result.isFailure && store.findSite(siteId) != null) enqueue(siteId)
+            result
+        } finally {
+            removing.remove(siteId)
+        }
     }
 
-    private fun process(siteId: UUID) = synchronized(siteLocks.computeIfAbsent(siteId) { Any() }) {
+    private fun process(siteId: UUID): Unit = synchronized(siteLocks.computeIfAbsent(siteId) { Any() }) {
         try {
             if (siteId in removing) return
             val site = store.findSite(siteId) ?: return
