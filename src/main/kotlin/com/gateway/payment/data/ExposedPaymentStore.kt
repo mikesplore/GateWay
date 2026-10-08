@@ -8,6 +8,7 @@ import com.gateway.payment.domain.PaymentStatus
 import com.gateway.payment.domain.PaymentTotals
 import com.gateway.payment.domain.PaymentEvent
 import com.gateway.payment.domain.PaymentProject
+import com.gateway.payment.domain.PaymentCustomer
 import com.gateway.payment.domain.PaymentSite
 import com.gateway.payment.domain.PaymentStore
 import com.gateway.payment.domain.ProviderPaymentEvent
@@ -223,6 +224,29 @@ class ExposedPaymentStore : PaymentStore, com.gateway.payment.domain.PaymentEven
     override fun reservePayment(accountId: UUID, amount: BigDecimal, currency: String, idempotencyKey: String, projectId: UUID?, requestEmail: String?, phoneNumber: String?, gatewayReference: String?, description: String?): com.gateway.payment.domain.PaymentReservation = transaction {
         val id = UUID.randomUUID()
         val now = LocalDateTime.now(ZoneOffset.UTC)
+        val email = requestEmail?.trim()?.lowercase()?.takeIf(String::isNotBlank)
+        val customer = if (email != null || phoneNumber != null) {
+            val byEmail = email?.let { value -> Customers.selectAll().where { (Customers.accountId eq accountId) and (Customers.email eq value) }.orderBy(Customers.createdAt).firstOrNull() }
+            val byPhone = if (byEmail == null) phoneNumber?.let { value -> Customers.selectAll().where { (Customers.accountId eq accountId) and (Customers.phoneNumber eq value) }.orderBy(Customers.createdAt).firstOrNull() } else null
+            val existingCustomer = byEmail ?: byPhone
+            if (existingCustomer != null) {
+                val customerId = existingCustomer[Customers.id]
+                Customers.update({ Customers.id eq customerId }) {
+                    if (email != null && existingCustomer[Customers.email] == null) it[Customers.email] = email
+                    if (phoneNumber != null && existingCustomer[Customers.phoneNumber] == null) it[Customers.phoneNumber] = phoneNumber
+                    it[Customers.updatedAt] = now
+                }
+                customerId
+            } else {
+                val customerId = UUID.randomUUID()
+                Customers.insert {
+                    it[Customers.id] = customerId; it[Customers.accountId] = accountId
+                    it[Customers.email] = email; it[Customers.phoneNumber] = phoneNumber
+                    it[Customers.createdAt] = now; it[Customers.updatedAt] = now
+                }
+                customerId
+            }
+        } else null
         val inserted = Payments.insertIgnore {
             it[Payments.id] = id
             it[Payments.accountId] = accountId
@@ -230,6 +254,7 @@ class ExposedPaymentStore : PaymentStore, com.gateway.payment.domain.PaymentEven
             it[Payments.providerReference] = "reservation:$id"
             it[Payments.gatewayReference] = gatewayReference ?: "reservation:$id"
             it[Payments.projectId] = projectId
+            it[Payments.customerId] = customer
             it[Payments.amount] = amount
             it[Payments.currency] = currency
             it[Payments.status] = "initializing"
@@ -357,7 +382,7 @@ class ExposedPaymentStore : PaymentStore, com.gateway.payment.domain.PaymentEven
 
     override fun createConfiguredSite(accountId: UUID, hostname: String, upstreamUrl: String?, tlsRef: String?, template: String, projectId: UUID?): PaymentSite = transaction {
         require(Accounts.selectAll().where { Accounts.id eq accountId }.count() > 0) { "Account not found" }
-        if (projectId != null) require(Projects.selectAll().where { (Projects.id eq projectId) and (Projects.accountId eq accountId) }.count() > 0) { "Project not found for account" }
+        if (projectId != null) require(Projects.selectAll().where { (Projects.id eq projectId) and (Projects.accountId eq accountId) and (Projects.status neq "archived") }.count() > 0) { "Project not found or archived for account" }
         val id = UUID.randomUUID(); val now = LocalDateTime.now(ZoneOffset.UTC)
         Sites.insert {
             it[Sites.id] = id; it[Sites.accountId] = accountId; it[Sites.projectId] = projectId; it[Sites.hostname] = hostname
@@ -380,7 +405,7 @@ class ExposedPaymentStore : PaymentStore, com.gateway.payment.domain.PaymentEven
     override fun allSites(): List<PaymentSite> = transaction { Sites.selectAll().map { it.toPaymentSite() } }
 
     override fun updateSite(accountId: UUID, siteId: UUID, hostname: String, upstreamUrl: String?, tlsRef: String?, template: String, projectId: UUID?): PaymentSite? = transaction {
-        if (projectId != null) require(Projects.selectAll().where { (Projects.id eq projectId) and (Projects.accountId eq accountId) }.count() > 0) { "Project not found for account" }
+        if (projectId != null) require(Projects.selectAll().where { (Projects.id eq projectId) and (Projects.accountId eq accountId) and (Projects.status neq "archived") }.count() > 0) { "Project not found or archived for account" }
         val changed = Sites.update({ (Sites.id eq siteId) and (Sites.accountId eq accountId) }) {
             it[Sites.projectId] = projectId; it[Sites.hostname] = hostname; it[Sites.upstreamUrl] = upstreamUrl; it[Sites.tlsRef] = tlsRef; it[Sites.template] = template
             it[Sites.applyStatus] = nextApplyStatus(); it[Sites.lastApplyError] = null
@@ -441,12 +466,95 @@ class ExposedPaymentStore : PaymentStore, com.gateway.payment.domain.PaymentEven
     }
 
     override fun listProjects(accountId: UUID): List<PaymentProject> = transaction {
-        Projects.selectAll().where { Projects.accountId eq accountId }.orderBy(Projects.createdAt, SortOrder.DESC).map { PaymentProject(it[Projects.id], it[Projects.accountId], it[Projects.siteId], it[Projects.name], it[Projects.billingReference], it[Projects.createdAt].toInstant(ZoneOffset.UTC)) }
+        Projects.selectAll().where { Projects.accountId eq accountId }.orderBy(Projects.createdAt, SortOrder.DESC).map { it.toPaymentProject() }
     }
 
     override fun projectBelongsToAccount(projectId: UUID, accountId: UUID): Boolean = transaction {
         Projects.selectAll().where { (Projects.id eq projectId) and (Projects.accountId eq accountId) }.count() > 0
     }
+
+    override fun projectAcceptsPayments(projectId: UUID): Boolean = transaction {
+        Projects.selectAll().where { (Projects.id eq projectId) and (Projects.status neq "archived") }.count() > 0
+    }
+
+    fun findProject(accountId: UUID, projectId: UUID): PaymentProject? = transaction {
+        Projects.selectAll().where { (Projects.id eq projectId) and (Projects.accountId eq accountId) }.singleOrNull()?.toPaymentProject()
+    }
+
+    fun setProjectStatus(accountId: UUID, projectId: UUID, status: String, reason: String?): PaymentProject? = transaction {
+        require(status in setOf("active", "suspended", "archived")) { "Project status must be active, suspended, or archived" }
+        val changed = Projects.update({ (Projects.id eq projectId) and (Projects.accountId eq accountId) }) {
+            it[Projects.status] = status; it[Projects.statusReason] = reason?.trim()?.takeIf(String::isNotBlank)?.take(256)
+        }
+        if (changed == 0) return@transaction null
+        val siteState = if (status == "active") "active" else "suspended"
+        Sites.update({ (Sites.projectId eq projectId) and (Sites.entitlementState neq "disabled_by_admin") }) {
+            it[Sites.entitlementState] = siteState
+            it[Sites.stateReason] = if (status == "active") "project_reactivated" else "project_$status"
+            it[Sites.stateChangedAt] = LocalDateTime.now(ZoneOffset.UTC)
+            it[Sites.stateEffectiveAt] = if (status == "active") null else LocalDateTime.now(ZoneOffset.UTC)
+            it[Sites.applyStatus] = nextApplyStatus(); it[Sites.lastApplyError] = null
+        }
+        Projects.selectAll().where { Projects.id eq projectId }.single().toPaymentProject()
+    }
+
+    fun listCustomers(accountId: UUID): List<PaymentCustomer> = transaction {
+        Customers.selectAll().where { Customers.accountId eq accountId }.orderBy(Customers.createdAt, SortOrder.DESC).map { it.toPaymentCustomer() }
+    }
+
+    fun findCustomer(accountId: UUID, customerId: UUID): PaymentCustomer? = transaction {
+        Customers.selectAll().where { (Customers.accountId eq accountId) and (Customers.id eq customerId) }.singleOrNull()?.toPaymentCustomer()
+    }
+
+    fun updateCustomer(accountId: UUID, customerId: UUID, displayName: String?): PaymentCustomer? = transaction {
+        val changed = Customers.update({ (Customers.accountId eq accountId) and (Customers.id eq customerId) }) {
+            it[Customers.displayName] = displayName?.trim()?.takeIf(String::isNotBlank)?.take(200)
+            it[Customers.updatedAt] = LocalDateTime.now(ZoneOffset.UTC)
+        }
+        if (changed == 0) null else Customers.selectAll().where { Customers.id eq customerId }.single().toPaymentCustomer()
+    }
+
+    fun customerPayments(accountId: UUID, customerId: UUID, limit: Int = 100): List<Payment> = transaction {
+        Payments.selectAll().where { (Payments.accountId eq accountId) and (Payments.customerId eq customerId) }
+            .orderBy(Payments.createdAt, SortOrder.DESC).limit(limit.coerceIn(1, 200)).map { it.toPayment() }
+    }
+
+    fun projectsForCustomer(accountId: UUID, customerId: UUID): List<PaymentProject> = transaction {
+        val projectIds = Payments.select(Payments.projectId).where {
+            (Payments.accountId eq accountId) and (Payments.customerId eq customerId) and Payments.projectId.isNotNull()
+        }.withDistinct().mapNotNull { it[Payments.projectId] }
+        if (projectIds.isEmpty()) emptyList() else Projects.selectAll().where {
+            (Projects.accountId eq accountId) and (Projects.id inList projectIds)
+        }.orderBy(Projects.name).map { it.toPaymentProject() }
+    }
+
+    fun customersForProject(accountId: UUID, projectId: UUID): List<PaymentCustomer> = transaction {
+        val customerIds = Payments.select(Payments.customerId).where {
+            (Payments.accountId eq accountId) and (Payments.projectId eq projectId) and Payments.customerId.isNotNull()
+        }.withDistinct().mapNotNull { it[Payments.customerId] }
+        if (customerIds.isEmpty()) emptyList() else Customers.selectAll().where {
+            (Customers.accountId eq accountId) and (Customers.id inList customerIds)
+        }.orderBy(Customers.updatedAt, SortOrder.DESC).map { it.toPaymentCustomer() }
+    }
+
+    fun projectPaymentTotals(accountId: UUID, projectId: UUID): PaymentTotals = transaction {
+        val rows = Payments.selectAll().where { (Payments.accountId eq accountId) and (Payments.projectId eq projectId) }.toList()
+        PaymentTotals(rows.size.toLong(), rows.fold(BigDecimal.ZERO) { sum, row -> sum + row[Payments.amount] },
+            rows.count { it[Payments.status] == "succeeded" }.toLong(), rows.count { it[Payments.status] == "pending" }.toLong(),
+            rows.count { it[Payments.status] == "failed" }.toLong(), rows.count { it[Payments.status] == "reversed" }.toLong(),
+            rows.groupBy { it[Payments.currency] }.mapValues { (_, currencyRows) -> currencyRows.fold(BigDecimal.ZERO) { sum, row -> sum + row[Payments.amount] } },
+            rows.filter { it[Payments.status] == "succeeded" }.groupBy { it[Payments.currency] }.mapValues { (_, currencyRows) -> currencyRows.fold(BigDecimal.ZERO) { sum, row -> sum + row[Payments.amount] } })
+    }
+
+    private fun ResultRow.toPaymentProject() = PaymentProject(
+        this[Projects.id], this[Projects.accountId], this[Projects.siteId], this[Projects.name], this[Projects.billingReference],
+        this[Projects.createdAt].toInstant(ZoneOffset.UTC), this[Projects.status], this[Projects.statusReason]
+    )
+
+    private fun ResultRow.toPaymentCustomer() = PaymentCustomer(
+        this[Customers.id], this[Customers.accountId], this[Customers.displayName], this[Customers.email], this[Customers.phoneNumber],
+        this[Customers.createdAt].toInstant(ZoneOffset.UTC), this[Customers.updatedAt].toInstant(ZoneOffset.UTC)
+    )
 
     override fun processProviderNotification(record: NewPaymentEvent, event: ProviderPaymentEvent?): String = transaction {
         val id = UUID.randomUUID()
@@ -524,7 +632,8 @@ class ExposedPaymentStore : PaymentStore, com.gateway.payment.domain.PaymentEven
 
     private fun setProjectEntitlement(projectId: UUID?, state: String, reason: String) {
         if (projectId == null) return
-        if (Projects.selectAll().where { Projects.id eq projectId }.count() == 0L) return
+        val project = Projects.selectAll().where { Projects.id eq projectId }.singleOrNull() ?: return
+        if (state == "active" && project[Projects.status] != "active") return
         Sites.update({ (Sites.projectId eq projectId) and (Sites.entitlementState neq "disabled_by_admin") and (Sites.entitlementState neq state) }) {
             it[Sites.entitlementState] = state; it[Sites.stateReason] = reason.take(128)
             it[Sites.stateChangedAt] = LocalDateTime.now(ZoneOffset.UTC)
@@ -551,6 +660,6 @@ class ExposedPaymentStore : PaymentStore, com.gateway.payment.domain.PaymentEven
         providerReference = this[Payments.providerReference], gatewayReference = this[Payments.gatewayReference] ?: this[Payments.providerReference], amount = this[Payments.amount], currency = this[Payments.currency],
         status = runCatching { PaymentStatus.valueOf(this[Payments.status].uppercase()) }.getOrDefault(PaymentStatus.PENDING),
         checkoutUrl = this[Payments.checkoutUrl], createdAt = this[Payments.createdAt].toInstant(ZoneOffset.UTC),
-        paidAt = this[Payments.paidAt]?.toInstant(ZoneOffset.UTC), projectId = this[Payments.projectId], providerTransactionId = this[Payments.providerTransactionId], providerRequestId = this[Payments.providerRequestId], customerPhone = this[Payments.customerPhone], nextReconciliationAt = this[Payments.nextReconciliationAt]?.toInstant(ZoneOffset.UTC), reconciliationAttempts = this[Payments.reconciliationAttempts], lastProviderError = this[Payments.lastProviderError], requestEmail = this[Payments.requestEmail], description = this[Payments.description]
+        paidAt = this[Payments.paidAt]?.toInstant(ZoneOffset.UTC), projectId = this[Payments.projectId], providerTransactionId = this[Payments.providerTransactionId], providerRequestId = this[Payments.providerRequestId], customerPhone = this[Payments.customerPhone], nextReconciliationAt = this[Payments.nextReconciliationAt]?.toInstant(ZoneOffset.UTC), reconciliationAttempts = this[Payments.reconciliationAttempts], lastProviderError = this[Payments.lastProviderError], requestEmail = this[Payments.requestEmail], description = this[Payments.description], customerId = this[Payments.customerId]
     )
 }

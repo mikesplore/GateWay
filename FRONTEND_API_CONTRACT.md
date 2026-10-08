@@ -90,11 +90,18 @@ For the browser dashboard, these routes accept **S** and scope results to the us
 | `GET /api/payments/{reference}` | — | Payment record |
 | `GET /api/payments/{reference}/history` | — | Array of `{previousStatus,status,source,providerTransactionId,occurredAt}` |
 | `POST /api/payments/{reference}/reconcile` | — | `{status,payment}`; statuses include `reconciled`, `unchanged`, `provider_unavailable`, `still_pending` |
-| `GET /api/projects` | — | Array of `{id,siteId,name,billingReference,createdAt}` |
+| `GET /api/projects` | — | Array of `{id,siteId,name,billingReference,createdAt,status,statusReason}` |
 | `POST /api/projects` | `{name,siteId?,billingReference?}` | `201` project record |
+| `GET /api/projects/{projectId}` | — | Project with linked sites, customers found through payments, payment totals, and recent payments |
+| `PATCH /api/projects/{projectId}` | `{status,reason?}` | Set `active`, `suspended`, or `archived`; manual suspension survives successful payment callbacks; archive retains history and blocks new payments |
+| `GET /api/customers` | — | Account-scoped customer records |
+| `GET /api/customers/{customerId}` | — | Customer, linked projects, and payment history |
+| `PATCH /api/customers/{customerId}` | `{displayName}` | Update customer display name |
 | `GET /api/sites` | — | Array of site records |
 | `POST /api/sites` | `{hostname,port,projectId}` | `201` site record; derives `http://127.0.0.1:{port}`, uses hostname for TLS, and queues Nginx apply (requires Nginx enabled) |
 | `PUT /api/sites/{siteId}` | `{hostname,upstreamUrl?,tlsRef?,template?,projectId?}` | Updated site record; queues enforcement apply |
+
+Payments store account-scoped `customerId` and optional `projectId` independently. Email/phone values identify or enrich the account customer record; customers are not owned by projects. Customer records are backfilled from existing payment contact data when migration V8 runs.
 
 Current payment response shape:
 
@@ -107,7 +114,10 @@ Current payment response shape:
   "currency": "KES",
   "status": "pending",
   "checkoutUrl": "https://...",
-  "projectId": "uuid"
+  "projectId": "uuid",
+  "customerId": "uuid",
+  "customerEmail": "payer@example.com",
+  "customerPhone": null
 }
 ```
 
@@ -181,6 +191,7 @@ These accept **O** for command-line clients or **S** for owner/operator users. T
 - Sign in (`/api/auth/login`), session restore (`/api/auth/session`), and logout (`/api/auth/logout`).
 - Overview: summary totals and recent payments.
 - Payments list, filters, details, status history, manual reconcile.
-- Projects and managed sites, including entitlement and Nginx apply status.
+- Project detail and lifecycle actions, linked sites, customers discovered through payments, and project payment totals.
+- Account-wide customer profiles linked to projects only through their payments.
 - Operations events/replay and Nginx drift/apply controls, gated by operator role.
 - API keys/settings only after session-authenticated key-management is implemented.

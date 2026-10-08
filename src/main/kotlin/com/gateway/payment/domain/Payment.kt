@@ -31,7 +31,8 @@ data class Payment(
     val lastProviderError: String? = null,
     val gatewayReference: String = providerReference,
     val requestEmail: String? = null,
-    val description: String? = null
+    val description: String? = null,
+    val customerId: UUID? = null
 )
 
 data class PaymentEvent(
@@ -104,7 +105,8 @@ interface PaymentProvider {
     suspend fun queryStatus(payment: Payment): Result<ProviderPaymentStatus>
 }
 
-data class PaymentProject(val id: UUID, val accountId: UUID, val siteId: UUID?, val name: String, val billingReference: String?, val createdAt: Instant)
+data class PaymentProject(val id: UUID, val accountId: UUID, val siteId: UUID?, val name: String, val billingReference: String?, val createdAt: Instant, val status: String = "active", val statusReason: String? = null)
+data class PaymentCustomer(val id: UUID, val accountId: UUID, val displayName: String?, val email: String?, val phoneNumber: String?, val createdAt: Instant, val updatedAt: Instant)
 data class PaymentSite(
     val id: UUID,
     val accountId: UUID,

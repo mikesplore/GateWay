@@ -55,6 +55,18 @@ class PaymentServiceTest {
         assertEquals(1, provider.initiationCount)
     }
 
+    @Test
+    fun `rejects payment for archived project before provider call`() = kotlinx.coroutines.runBlocking {
+        val store = FakeStore().apply { acceptsProjectPayments = false }
+        val provider = FakeProvider()
+        val result = ProviderPaymentService(store, mapOf(provider.name to provider)).initiate(
+            "test", InitiatePaymentCommand(UUID.randomUUID(), "a@b.c", BigDecimal("10.00"), "KES", projectId = UUID.randomUUID())
+        )
+        assertTrue(result.isFailure)
+        assertEquals("Archived projects cannot receive payments", result.exceptionOrNull()?.message)
+        assertEquals(0, provider.initiationCount)
+    }
+
     private class FakeProvider : PaymentProvider {
         var initiationCount = 0
         var overrideName = "test"
@@ -71,6 +83,7 @@ class PaymentServiceTest {
 
     private class FakeStore : PaymentStore {
         var exists = true
+        var acceptsProjectPayments = true
         var payment: Payment? = null
         private val byKey = mutableMapOf<String, Payment>()
         override fun accountExists(accountId: UUID) = exists
@@ -107,7 +120,8 @@ class PaymentServiceTest {
         override fun listSites(accountId: UUID) = emptyList<PaymentSite>()
         override fun createProject(accountId: UUID, siteId: UUID, name: String, billingReference: String?) = error("unused")
         override fun listProjects(accountId: UUID) = emptyList<PaymentProject>()
-        override fun projectBelongsToAccount(projectId: UUID, accountId: UUID) = false
+        override fun projectBelongsToAccount(projectId: UUID, accountId: UUID) = true
+        override fun projectAcceptsPayments(projectId: UUID) = acceptsProjectPayments
         override fun recordReconciliationFailure(paymentId: UUID, error: String, nextAttemptAt: Instant) = Unit
         override fun releaseReconciliationClaim(paymentId: UUID) = Unit
     }

@@ -26,17 +26,17 @@ Set `NGINX_ENABLED=true` only after the include is active and the managed direct
 
 Set a site's `tlsRef` to the certificate directory name, usually its hostname. Active and suspended configs both listen with that certificate, so suspension keeps HTTPS valid. `NGINX_CERTIFICATE_DIRECTORY` defaults to `/etc/letsencrypt/live`.
 
-GateWay checks for `fullchain.pem` and `privkey.pem` before applying a TLS site. If absent, it can invoke an optional external certificate helper configured with `GATEWAY_CERTIFICATE_HELPER` and `GATEWAY_CERTIFICATE_EMAIL`. The helper contract is:
+GateWay checks for `fullchain.pem` and `privkey.pem` before applying a TLS site. If absent, it invokes Certbot's Nginx plugin automatically. Set `GATEWAY_CERTIFICATE_EMAIL` to associate an email with the certificate; when unset, Certbot is registered without an email. The domain must resolve to this host, Nginx must be running, and inbound HTTP validation must be reachable. An optional external certificate helper can override Certbot with `GATEWAY_CERTIFICATE_HELPER`. The helper contract is:
 
 ```text
 <absolute-helper-path> ensure <certificate-domain> <email>
 ```
 
-The helper must be idempotent, run non-interactively, and leave the two certificate files in the configured certificate directory. Grant sudo access only to the helper command form used by your deployment. Without a helper, install/renew certificates outside GateWay; the renderer itself does not run Certbot.
+The helper must be idempotent, run non-interactively, and leave the two certificate files in the configured certificate directory. Grant sudo access only to the helper command form used by your deployment. Certbot renewals should be enabled through the host's normal Certbot timer.
 
 ## Site, project, and entitlement flow
 
-Create a project as a billing grouping, then attach one or more sites using `projectId`. A site records its hostname, upstream URL, optional TLS reference, template, entitlement, and apply result. The only initial template is `proxy`. Upstreams must be absolute `http` or `https` URLs with a hostname and optional port; paths, credentials, queries, and fragments are rejected.
+Create a project as a billing grouping, then attach one or more sites using `projectId`. Site creation takes hostname, local application port, and project ID; GateWay derives `http://127.0.0.1:<port>` and uses the hostname for TLS. A site records its upstream, certificate reference, template, entitlement, and apply result. The only initial template is `proxy`.
 
 ```http
 POST /api/projects
@@ -51,10 +51,10 @@ POST /api/sites
 Authorization: Bearer <merchant-api-key>
 Content-Type: application/json
 
-{"hostname":"wash.example.com","upstreamUrl":"http://127.0.0.1:5173","tlsRef":"wash.example.com","projectId":"<project-uuid>"}
+{"hostname":"wash.example.com","port":5173,"projectId":"<project-uuid>"}
 ```
 
-New sites start suspended. Once an authenticated provider event or provider status query confirms a successful payment for the linked project, its sites become active. A verified reversal suspends them again. These transitions are transactional with the payment event and deduplicated through the provider event store. A successful payment currently grants indefinite active entitlement; recurring billing periods, plans, and amount-to-duration rules are not implemented. Operations can set `active`, `grace`, `suspended`, or `disabled_by_admin` through `PUT /api/ops/sites/{siteId}/entitlement`. A grace request must include a future ISO-8601 `effectiveAt`; a scheduler changes it to suspended at expiry. `disabled_by_admin` is not overridden by payment events.
+New projects and sites begin suspended. Once an authenticated provider event or provider status query confirms a successful payment for an active project, its sites become active. A verified reversal suspends them again. An operator can suspend or reactivate a project through `PATCH /api/projects/{projectId}`; successful payments never reactivate a manually suspended project. Archiving retains payment history and prevents new payments. These transitions are transactional with the payment event and deduplicated through the provider event store. A successful payment currently grants indefinite active entitlement; recurring billing periods, plans, and amount-to-duration rules are not implemented. Operations can set `active`, `grace`, `suspended`, or `disabled_by_admin` through `PUT /api/ops/sites/{siteId}/entitlement`. A grace request must include a future ISO-8601 `effectiveAt`; a scheduler changes it to suspended at expiry. `disabled_by_admin` is not overridden by payment events.
 
 Active and grace sites proxy to their upstream. Suspended and admin-disabled sites return a static `402` response with `Cache-Control: no-store`, HTML for browsers and JSON when `Accept: application/json` is requested. No request-time call to GateWay is made.
 

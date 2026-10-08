@@ -29,6 +29,7 @@ import io.ktor.server.request.receive
 import io.ktor.server.response.respond
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
+import io.ktor.server.routing.patch
 import io.ktor.server.routing.put
 import io.ktor.server.routing.routing
 import io.ktor.server.application.ApplicationStopped
@@ -266,6 +267,31 @@ fun Application.configurePaymentRoutes() {
                 total.amountsByCurrency.mapValues { it.value.toPlainString() }, total.succeededByCurrency.mapValues { it.value.toPlainString() }))
         }
 
+        get("/api/customers") {
+            val account = authenticatedAccount(call.request.headers["Authorization"], humanAuth.session(call.request.cookies["gateway_session"])?.first)
+            if (account == null) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "A valid merchant API key is required")); return@get }
+            call.respond(store.listCustomers(account.id).map(CustomerResponse::from))
+        }
+        get("/api/customers/{customerId}") {
+            val account = authenticatedAccount(call.request.headers["Authorization"], humanAuth.session(call.request.cookies["gateway_session"])?.first)
+            if (account == null) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "A valid merchant API key is required")); return@get }
+            val customerId = runCatching { UUID.fromString(call.parameters["customerId"]) }.getOrNull()
+            if (customerId == null) { call.respond(HttpStatusCode.BadRequest, ApiError("invalid_customer_id", "A valid customer ID is required")); return@get }
+            val customer = store.findCustomer(account.id, customerId)
+            if (customer == null) { call.respond(HttpStatusCode.NotFound, ApiError("customer_not_found", "Customer not found")); return@get }
+            call.respond(CustomerDetailResponse(CustomerResponse.from(customer), store.customerPayments(account.id, customerId).map(PaymentResponse::from), store.projectsForCustomer(account.id, customerId).map(ProjectResponse::from)))
+        }
+        patch("/api/customers/{customerId}") {
+            val account = authenticatedAccount(call.request.headers["Authorization"], humanAuth.session(call.request.cookies["gateway_session"])?.first)
+            if (account == null) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "A valid merchant API key is required")); return@patch }
+            val customerId = runCatching { UUID.fromString(call.parameters["customerId"]) }.getOrNull()
+            val req = runCatching { call.receive<UpdateCustomerRequest>() }.getOrNull()
+            if (customerId == null || req == null || req.displayName?.length ?: 0 > 200) { call.respond(HttpStatusCode.BadRequest, ApiError("invalid_customer", "A valid customer name is required")); return@patch }
+            val customer = store.updateCustomer(account.id, customerId, req.displayName)
+            if (customer == null) call.respond(HttpStatusCode.NotFound, ApiError("customer_not_found", "Customer not found"))
+            else call.respond(CustomerResponse.from(customer))
+        }
+
         post("/api/payments/{reference}/reconcile") {
             val account = authenticatedAccount(call.request.headers["Authorization"], humanAuth.session(call.request.cookies["gateway_session"])?.first)
             if (account == null) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "A valid merchant API key is required")); return@post }
@@ -350,6 +376,31 @@ fun Application.configurePaymentRoutes() {
             val account = authenticatedAccount(call.request.headers["Authorization"], humanAuth.session(call.request.cookies["gateway_session"])?.first)
             if (account == null) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "A valid merchant API key is required")); return@get }
             call.respond(store.listProjects(account.id).map(ProjectResponse::from))
+        }
+        get("/api/projects/{projectId}") {
+            val account = authenticatedAccount(call.request.headers["Authorization"], humanAuth.session(call.request.cookies["gateway_session"])?.first)
+            if (account == null) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "A valid merchant API key is required")); return@get }
+            val projectId = runCatching { UUID.fromString(call.parameters["projectId"]) }.getOrNull()
+            if (projectId == null) { call.respond(HttpStatusCode.BadRequest, ApiError("invalid_project_id", "A valid project ID is required")); return@get }
+            val project = store.findProject(account.id, projectId)
+            if (project == null) { call.respond(HttpStatusCode.NotFound, ApiError("project_not_found", "Project not found")); return@get }
+            val totals = store.projectPaymentTotals(account.id, projectId)
+            val summary = PaymentSummaryResponse(totals.count, totals.succeededCount, totals.pendingCount, totals.failedCount, totals.reversedCount, totals.amountsByCurrency.mapValues { it.value.toPlainString() }, totals.succeededByCurrency.mapValues { it.value.toPlainString() })
+            call.respond(ProjectDetailResponse(ProjectResponse.from(project), store.listSites(account.id).filter { it.projectId == projectId }.map(SiteResponse::from), store.customersForProject(account.id, projectId).map(CustomerResponse::from), store.listPayments(account.id, projectId = projectId, limit = 100).map(PaymentResponse::from), summary))
+        }
+        patch("/api/projects/{projectId}") {
+            val account = authenticatedAccount(call.request.headers["Authorization"], humanAuth.session(call.request.cookies["gateway_session"])?.first)
+            if (account == null) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "A valid merchant API key is required")); return@patch }
+            val projectId = runCatching { UUID.fromString(call.parameters["projectId"]) }.getOrNull()
+            val req = runCatching { call.receive<UpdateProjectStatusRequest>() }.getOrNull()
+            if (projectId == null || req == null || req.status !in setOf("active", "suspended", "archived") || req.reason?.length ?: 0 > 256) { call.respond(HttpStatusCode.BadRequest, ApiError("invalid_project_status", "Status must be active, suspended, or archived")); return@patch }
+            val project = runCatching { store.setProjectStatus(account.id, projectId, req.status, req.reason) }.getOrElse {
+                call.respond(HttpStatusCode.BadRequest, ApiError("project_update_failed", it.message ?: "Unable to update project")); return@patch
+            }
+            if (project == null) { call.respond(HttpStatusCode.NotFound, ApiError("project_not_found", "Project not found")); return@patch }
+            nginxQueue.enqueueAll()
+            store.audit("project_status_changed", projectId.toString(), "${req.status}:${req.reason.orEmpty()}")
+            call.respond(ProjectResponse.from(project))
         }
         post("/api/projects") {
             val account = authenticatedAccount(call.request.headers["Authorization"], humanAuth.session(call.request.cookies["gateway_session"])?.first)
@@ -508,8 +559,8 @@ private fun redactPayload(provider: String, payload: String): String {
 }
 @Serializable data class CreatedApiKeyResponse(val key: MerchantApiKeyResponse, val secret: String)
 @Serializable data class ApiMessage(val status: String)
-@Serializable data class PaymentResponse(val id: String, val provider: String, val reference: String, val amount: String, val currency: String, val status: String, val checkoutUrl: String?, val projectId: String?) {
-    companion object { fun from(p: com.gateway.payment.domain.Payment) = PaymentResponse(p.id.toString(), p.provider, p.gatewayReference, p.amount.toPlainString(), p.currency, p.status.name.lowercase(), p.checkoutUrl, p.projectId?.toString()) }
+@Serializable data class PaymentResponse(val id: String, val provider: String, val reference: String, val amount: String, val currency: String, val status: String, val checkoutUrl: String?, val projectId: String?, val customerId: String? = null, val customerEmail: String? = null, val customerPhone: String? = null, val description: String? = null, val createdAt: String? = null, val paidAt: String? = null) {
+    companion object { fun from(p: com.gateway.payment.domain.Payment) = PaymentResponse(p.id.toString(), p.provider, p.gatewayReference, p.amount.toPlainString(), p.currency, p.status.name.lowercase(), p.checkoutUrl, p.projectId?.toString(), p.customerId?.toString(), p.requestEmail, p.customerPhone, p.description, p.createdAt.toString(), p.paidAt?.toString()) }
 }
 @Serializable data class ApiError(val code: String, val message: String)
 @Serializable data class WebhookResponse(val status: String)
@@ -541,6 +592,13 @@ private fun redactPayload(provider: String, payload: String): String {
     ) }
 }
 @Serializable data class CreateProjectRequest(val name: String, val siteId: String? = null, val billingReference: String? = null)
-@Serializable data class ProjectResponse(val id: String, val siteId: String?, val name: String, val billingReference: String?, val createdAt: String) {
-    companion object { fun from(project: PaymentProject) = ProjectResponse(project.id.toString(), project.siteId?.toString(), project.name, project.billingReference, project.createdAt.toString()) }
+@Serializable data class ProjectResponse(val id: String, val siteId: String?, val name: String, val billingReference: String?, val createdAt: String, val status: String = "active", val statusReason: String? = null) {
+    companion object { fun from(project: PaymentProject) = ProjectResponse(project.id.toString(), project.siteId?.toString(), project.name, project.billingReference, project.createdAt.toString(), project.status, project.statusReason) }
 }
+@Serializable data class ProjectDetailResponse(val project: ProjectResponse, val sites: List<SiteResponse>, val customers: List<CustomerResponse>, val recentPayments: List<PaymentResponse>, val paymentSummary: PaymentSummaryResponse)
+@Serializable data class CustomerResponse(val id: String, val displayName: String?, val email: String?, val phoneNumber: String?, val createdAt: String, val updatedAt: String) {
+    companion object { fun from(customer: com.gateway.payment.domain.PaymentCustomer) = CustomerResponse(customer.id.toString(), customer.displayName, customer.email, customer.phoneNumber, customer.createdAt.toString(), customer.updatedAt.toString()) }
+}
+@Serializable data class CustomerDetailResponse(val customer: CustomerResponse, val payments: List<PaymentResponse>, val projects: List<ProjectResponse>)
+@Serializable data class UpdateCustomerRequest(val displayName: String?)
+@Serializable data class UpdateProjectStatusRequest(val status: String, val reason: String? = null)

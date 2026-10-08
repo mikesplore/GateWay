@@ -38,9 +38,23 @@ object Projects : Table("projects") {
     val siteId = uuid("site_id").references(Sites.id).nullable()
     val name = varchar("name", 200)
     val billingReference = varchar("billing_reference", 128).nullable()
+    val status = varchar("status", 24).default("active")
+    val statusReason = varchar("status_reason", 256).nullable()
     val createdAt = datetime("created_at")
     override val primaryKey = PrimaryKey(id)
     init { uniqueIndex(accountId, name); index(false, accountId, createdAt) }
+}
+
+object Customers : Table("customers") {
+    val id = uuid("id")
+    val accountId = uuid("account_id").references(Accounts.id)
+    val displayName = varchar("display_name", 200).nullable()
+    val email = varchar("email", 320).nullable()
+    val phoneNumber = varchar("phone_number", 24).nullable()
+    val createdAt = datetime("created_at")
+    val updatedAt = datetime("updated_at")
+    override val primaryKey = PrimaryKey(id)
+    init { index(false, accountId, createdAt) }
 }
 
 object MerchantApiKeys : Table("merchant_api_keys") {
@@ -60,6 +74,7 @@ object Payments : Table("payments") {
     val id = uuid("id")
     val accountId = uuid("account_id")
     val projectId = uuid("project_id").nullable()
+    val customerId = uuid("customer_id").nullable()
     val provider = varchar("provider", 32)
     val providerReference = varchar("provider_reference", 128)
     val gatewayReference = varchar("gateway_reference", 128)

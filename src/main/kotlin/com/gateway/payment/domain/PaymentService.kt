@@ -22,6 +22,7 @@ class ProviderPaymentService(private val payments: PaymentStore, private val pro
         if (validationError != null) return Result.failure(IllegalArgumentException(validationError))
         if (!payments.accountExists(command.accountId)) return Result.failure(UnknownPaymentAccount())
         if (command.projectId != null && !payments.projectBelongsToAccount(command.projectId, command.accountId)) return Result.failure(IllegalArgumentException("Project not found for account"))
+        if (command.projectId != null && !payments.projectAcceptsPayments(command.projectId)) return Result.failure(IllegalArgumentException("Archived projects cannot receive payments"))
         val reference = command.gatewayReference ?: "gw_${java.util.UUID.randomUUID().toString().replace("-", "")}" 
         val idempotencyKey = "${provider.name}:${command.idempotencyKey ?: reference}"
         val reservation = payments.reservePayment(command.accountId, command.amount.setScale(2), command.currency.uppercase(), idempotencyKey, command.projectId, command.email.takeIf(String::isNotBlank), command.phoneNumber, reference, command.description?.take(256))
@@ -63,6 +64,7 @@ interface PaymentStore : AccountStore {
         createProject(accountId, siteId ?: throw IllegalArgumentException("A site ID is required"), name, billingReference)
     fun listProjects(accountId: java.util.UUID): List<PaymentProject>
     fun projectBelongsToAccount(projectId: java.util.UUID, accountId: java.util.UUID): Boolean
+    fun projectAcceptsPayments(projectId: java.util.UUID): Boolean = true
     fun recordReconciliationFailure(paymentId: java.util.UUID, error: String, nextAttemptAt: java.time.Instant)
     fun releaseReconciliationClaim(paymentId: java.util.UUID)
 }
