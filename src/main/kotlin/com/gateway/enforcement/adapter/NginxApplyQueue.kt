@@ -57,10 +57,14 @@ class HostCertificateProvisioner(
 ) : CertificateProvisioner {
     override fun ensure(certificateDomain: String): String? {
         val domain = runCatching { SiteInput.hostname(certificateDomain) }.getOrElse { return it.message }
+        // Reuse an existing certificate first. Certbot may have created a suffixed
+        // directory (for example domain-0001) if the host already had a lineage.
+        fun hasCertificate(dir: File) = File(dir, "fullchain.pem").isFile && File(dir, "privkey.pem").isFile
         val certDir = File(certificateRoot, domain)
-        val fullchain = File(certDir, "fullchain.pem")
-        val key = File(certDir, "privkey.pem")
-        if (fullchain.isFile && key.isFile) return null
+        val matchingDirectories = certificateRoot.listFiles()
+            .orEmpty()
+            .filter { it.isDirectory && (it.name == domain || it.name.startsWith("${domain}-") || it.name.startsWith("${domain}_")) }
+        if (hasCertificate(certDir) || matchingDirectories.any(::hasCertificate)) return null
         val command = if (helper.isNotBlank()) {
             if (!File(helper).isAbsolute) return "GATEWAY_CERTIFICATE_HELPER must be an absolute executable path"
             listOf("sudo", "-n", helper, "ensure", domain, email)
@@ -75,7 +79,8 @@ class HostCertificateProvisioner(
         }
         val result = executeCommand(command)
         if (result != null) return "Certificate provisioning failed: ${result.take(2000)}"
-        return if (fullchain.isFile && key.isFile) null else "Certificate provisioner completed but certificate files are missing for $domain"
+        return if (hasCertificate(certDir) || matchingDirectories.any(::hasCertificate)) null
+        else "Certificate provisioner completed but certificate files are missing for $domain"
     }
 }
 
