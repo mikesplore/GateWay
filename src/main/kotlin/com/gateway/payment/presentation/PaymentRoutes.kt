@@ -392,7 +392,7 @@ fun Application.configurePaymentRoutes() {
             val projectId = req.projectId?.let { runCatching { UUID.fromString(it) }.getOrNull() }
             val billingAmount = req.billingAmount.toBigDecimalOrNull()
             if (hostname == null || upstream == null || projectId == null || req.template != "proxy" || !validSiteBilling(billingAmount)) {
-                call.respond(HttpStatusCode.BadRequest, ApiError("invalid_site", "Provide a valid hostname, application port, project, non-negative amount with up to two decimals, and three-letter currency")); return@post
+                call.respond(HttpStatusCode.BadRequest, ApiError("invalid_site", "Provide a valid hostname, application port, project, and non-negative KES amount with up to two decimals")); return@post
             }
             if (!GatewayConfig.nginxEnabled) { call.respond(HttpStatusCode.Conflict, ApiError("nginx_disabled", "Enable Nginx enforcement before connecting a site")); return@post }
             val site = runCatching { store.createConfiguredSite(account.id, hostname, upstream, hostname, req.template, projectId, billingAmount!!) }.getOrElse { call.respond(HttpStatusCode.Conflict, ApiError("site_creation_failed", it.message ?: "Unable to create site")); return@post }
@@ -404,7 +404,8 @@ fun Application.configurePaymentRoutes() {
             if (account == null) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "A valid merchant API key is required")); return@put }
             val id = runCatching { UUID.fromString(call.parameters["siteId"]) }.getOrNull()
             val req = runCatching { call.receive<UpdateSiteRequest>() }.getOrNull()
-            if (id == null || req == null) { call.respond(HttpStatusCode.BadRequest, ApiError("invalid_site", "A valid site ID and site request are required")); return@put }
+            if (id == null) { call.respond(HttpStatusCode.BadRequest, ApiError("invalid_site_id", "A valid site ID is required")); return@put }
+            if (req == null) { call.respond(HttpStatusCode.BadRequest, ApiError("invalid_site_request", "The site settings request could not be read. Refresh the page and try again.")); return@put }
             val hostname = runCatching { SiteInput.hostname(req.hostname) }.getOrNull()
             val upstream = req.upstreamUrl?.let { runCatching { SiteInput.upstream(it) }.getOrNull() }
             val tls = runCatching { SiteInput.tlsRef(req.tlsRef) }.getOrNull()
