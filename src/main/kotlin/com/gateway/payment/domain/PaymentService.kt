@@ -57,6 +57,7 @@ interface PaymentStore : AccountStore {
     fun createSite(accountId: java.util.UUID, hostname: String): PaymentSite
     fun createConfiguredSite(accountId: java.util.UUID, hostname: String, upstreamUrl: String?, tlsRef: String?, template: String, projectId: java.util.UUID?): PaymentSite = createSite(accountId, hostname)
     fun listSites(accountId: java.util.UUID): List<PaymentSite>
+    fun deleteSite(accountId: java.util.UUID, siteId: java.util.UUID): Boolean = false
     fun updateSite(accountId: java.util.UUID, siteId: java.util.UUID, hostname: String, upstreamUrl: String?, tlsRef: String?, template: String, projectId: java.util.UUID?): PaymentSite? = null
     fun setEntitlement(siteId: java.util.UUID, state: String, reason: String, effectiveAt: java.time.Instant?): Boolean = false
     fun createProject(accountId: java.util.UUID, siteId: java.util.UUID, name: String, billingReference: String?): PaymentProject

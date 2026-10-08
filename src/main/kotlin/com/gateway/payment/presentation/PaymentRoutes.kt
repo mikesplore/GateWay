@@ -23,11 +23,14 @@ import com.gateway.payment.domain.ProviderPaymentEvent
 import com.gateway.payment.domain.HumanAuthService
 import com.gateway.payment.domain.GatewayUser
 import io.ktor.http.HttpStatusCode
+import io.ktor.http.ContentType
 import io.ktor.server.application.Application
 import io.ktor.server.request.receiveText
 import io.ktor.server.request.receive
 import io.ktor.server.response.respond
+import io.ktor.server.response.respondText
 import io.ktor.server.routing.get
+import io.ktor.server.routing.delete
 import io.ktor.server.routing.post
 import io.ktor.server.routing.patch
 import io.ktor.server.routing.put
@@ -91,6 +94,32 @@ fun Application.configurePaymentRoutes() {
     }
     monitor.subscribe(ApplicationStopped) { jobs.cancel() }
     routing {
+        // These endpoints are called only from Gateway-managed Nginx locations.
+        // Nginx's internal auth location strips browser headers and request bodies.
+        get("/api/enforcement/auth") {
+            val siteId = runCatching { UUID.fromString(call.request.queryParameters["siteId"]) }.getOrNull()
+            val site = siteId?.let(store::findSite)
+            if (site?.entitlementState in setOf("active", "grace")) call.respond(HttpStatusCode.OK)
+            else call.respond(HttpStatusCode.Forbidden)
+        }
+        get("/api/enforcement/paywall") {
+            val siteId = runCatching { UUID.fromString(call.request.queryParameters["siteId"]) }.getOrNull()
+            val site = siteId?.let(store::findSite)
+            val hostname = site?.hostname ?: "this site"
+            call.response.headers.append(io.ktor.http.HttpHeaders.CacheControl, "no-store")
+            val acceptsJson = call.request.headers[io.ktor.http.HttpHeaders.Accept]
+                ?.contains("application/json", ignoreCase = true) == true
+            if (acceptsJson) {
+                call.respondText(
+                    "{\"error\":\"payment_required\",\"status\":402,\"site\":\"$hostname\"}",
+                    ContentType.Application.Json,
+                    HttpStatusCode.PaymentRequired
+                )
+            } else {
+                val body = "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Payment required</title></head><body><main><h1>Payment required</h1><p>Access to $hostname is currently unavailable. Contact the site owner.</p></main></body></html>"
+                call.respondText(body, ContentType.Text.Html, HttpStatusCode.PaymentRequired)
+            }
+        }
         post("/api/auth/login") {
             val request = runCatching { call.receive<LoginRequest>() }.getOrNull()
             if (request == null || request.password.isEmpty() || request.password.length > 256) { call.respond(HttpStatusCode.BadRequest, ApiError("invalid_request", "Email and password are required")); return@post }
@@ -335,6 +364,23 @@ fun Application.configurePaymentRoutes() {
             val account = authenticatedAccount(call.request.headers["Authorization"], humanAuth.session(call.request.cookies["gateway_session"])?.first)
             if (account == null) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "A valid merchant API key is required")); return@get }
             call.respond(store.listSites(account.id).map(SiteResponse::from))
+        }
+        delete("/api/sites/{siteId}") {
+            val account = authenticatedAccount(call.request.headers["Authorization"], humanAuth.session(call.request.cookies["gateway_session"])?.first)
+            if (account == null) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "A valid merchant API key is required")); return@delete }
+            val id = runCatching { UUID.fromString(call.parameters["siteId"]) }.getOrNull()
+            if (id == null) { call.respond(HttpStatusCode.BadRequest, ApiError("invalid_site_id", "A valid site ID is required")); return@delete }
+            if (store.listSites(account.id).none { it.id == id }) { call.respond(HttpStatusCode.NotFound, ApiError("site_not_found", "Site not found")); return@delete }
+            val result = nginxQueue.removeSite(account.id, id)
+            result.fold(
+                onSuccess = {
+                    store.audit("site_deleted", id.toString(), "Gateway-managed Nginx config removed")
+                    call.respond(HttpStatusCode.NoContent)
+                },
+                onFailure = { error ->
+                    call.respond(HttpStatusCode.Conflict, ApiError("site_delete_failed", error.message ?: "Unable to remove the managed site"))
+                }
+            )
         }
         post("/api/sites") {
             val account = authenticatedAccount(call.request.headers["Authorization"], humanAuth.session(call.request.cookies["gateway_session"])?.first)

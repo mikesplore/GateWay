@@ -57,60 +57,86 @@ object SiteInput {
 }
 
 object NginxRenderer {
-    fun render(site: SiteEnforcementConfig, certificateRoot: String = "/etc/letsencrypt/live"): String {
+    fun render(site: SiteEnforcementConfig, certificateRoot: String = "/etc/letsencrypt/live", gatewayPort: Int = 8080): String {
         val normalizedCertificateRoot = java.nio.file.Path.of(certificateRoot).toAbsolutePath().normalize()
         require(normalizedCertificateRoot.toString() == certificateRoot && !certificateRoot.contains("..")) { "Certificate directory must be an absolute normalized path" }
+        require(gatewayPort in 1..65535) { "Gateway port must be between 1 and 65535" }
         require(site.template == "proxy") { "Unsupported site template" }
         val host = SiteInput.hostname(site.hostname)
-        val tls = SiteInput.tlsRef(site.tlsRef)
+        // HTTPS is required for managed sites. A missing explicit reference uses
+        // the site's hostname as the standard Let's Encrypt lineage.
+        val tls = SiteInput.tlsRef(site.tlsRef) ?: host
         val action = enforcementAction(site.entitlementState)
         val upstream = site.upstreamUrl?.let(SiteInput::upstream)
         if (action == EnforcementAction.PROXY) require(upstream != null) { "An upstream URL is required before enabling a site" }
+        val authLocation = "gateway-auth-${site.id}"
+        val paywallLocation = "@gateway-paywall-${site.id}"
         return buildString {
             appendLine("# gateway:site:${site.id}")
             appendLine("# gateway:hostname:$host")
-            if (tls != null) {
-                appendLine("server {")
-                appendLine("    listen 80;")
-                appendLine("    listen [::]:80;")
-                appendLine("    server_name $host;")
-                appendLine("    return 301 https://\$host\$request_uri;")
-                appendLine("}")
-                appendLine()
-            }
             appendLine("server {")
-            appendLine(if (tls == null) "    listen 80;" else "    listen 443 ssl;")
-            if (tls == null) appendLine("    listen [::]:80;") else appendLine("    listen [::]:443 ssl;")
-            if (tls != null) {
-                appendLine("    ssl_certificate $normalizedCertificateRoot/$tls/fullchain.pem;")
-                appendLine("    ssl_certificate_key $normalizedCertificateRoot/$tls/privkey.pem;")
-            }
+            appendLine("    listen 80;")
+            appendLine("    listen [::]:80;")
+            appendLine("    server_name $host;")
+            appendLine("    return 301 https://\$host\$request_uri;")
+            appendLine("}")
+            appendLine()
+            appendLine("server {")
+            appendLine("    listen 443 ssl;")
+            appendLine("    listen [::]:443 ssl;")
+            appendLine("    http2 on;")
+            appendLine("    ssl_certificate $normalizedCertificateRoot/$tls/fullchain.pem;")
+            appendLine("    ssl_certificate_key $normalizedCertificateRoot/$tls/privkey.pem;")
             appendLine("    server_name $host;")
             appendLine()
-            if (action == EnforcementAction.PROXY) {
-                val uri = URI(upstream!!)
-                appendLine("    location / {")
-                appendLine("        proxy_pass $upstream;")
-                appendLine("        proxy_http_version 1.1;")
-                appendLine("        proxy_set_header Host \$host;")
-                appendLine("        proxy_set_header X-Real-IP \$remote_addr;")
-                appendLine("        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;")
-                appendLine("        proxy_set_header X-Forwarded-Proto \$scheme;")
-                appendLine("        proxy_set_header Upgrade \$http_upgrade;")
-                appendLine("        proxy_set_header Connection \"upgrade\";")
-                if (uri.scheme == "https") appendLine("        proxy_ssl_server_name on;")
-                appendLine("    }")
-            } else {
-                appendLine("    default_type application/json;")
-                appendLine("    add_header Cache-Control \"no-store\" always;")
-                appendLine("    if (\$http_accept ~* \"application/json\") {")
-                appendLine("        return 402 '{\"error\":\"payment_required\",\"status\":402}';")
-                appendLine("    }")
-                appendLine("    location / {")
-                appendLine("        default_type text/html;")
-                appendLine("        return 402 '<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Payment required</title></head><body><h1>Payment required</h1><p>Access to $host is currently suspended. Contact the site owner.</p></body></html>' ;")
-                appendLine("    }")
-            }
+            appendLine("    location / {")
+            appendLine("        auth_request /$authLocation;")
+            appendLine("        error_page 403 = $paywallLocation;")
+            if (upstream != null) appendLine("        proxy_pass $upstream;")
+            appendLine("        proxy_http_version 1.1;")
+            appendLine("        proxy_set_header Upgrade \$http_upgrade;")
+            appendLine("        proxy_set_header Connection \"upgrade\";")
+            appendLine("        proxy_set_header Host \$host;")
+            appendLine("        proxy_set_header X-Real-IP \$remote_addr;")
+            appendLine("        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;")
+            appendLine("        proxy_set_header X-Forwarded-Proto \$scheme;")
+            if (upstream?.startsWith("https://") == true) appendLine("        proxy_ssl_server_name on;")
+            appendLine("    }")
+            appendLine()
+            appendLine("    # Internal Nginx authorization subrequest; strip browser headers and body.")
+            appendLine("    location = /$authLocation {")
+            appendLine("        internal;")
+            appendLine("        proxy_pass http://127.0.0.1:$gatewayPort/api/enforcement/auth?siteId=${site.id};")
+            appendLine("        proxy_method GET;")
+            appendLine("        proxy_pass_request_headers off;")
+            appendLine("        proxy_pass_request_body off;")
+            appendLine("        proxy_set_header Content-Length \"\";")
+            appendLine("        proxy_set_header Content-Type \"\";")
+            appendLine("        proxy_set_header Transfer-Encoding \"\";")
+            appendLine("        proxy_set_header Authorization \"\";")
+            appendLine("        proxy_set_header Cookie \"\";")
+            appendLine("        proxy_set_header Origin \"\";")
+            appendLine("        proxy_set_header Referer \"\";")
+            appendLine("        proxy_set_header User-Agent \"Nginx-Auth-Check\";")
+            appendLine("        proxy_set_header Accept \"\";")
+            appendLine("        proxy_set_header Accept-Encoding \"\";")
+            appendLine("        proxy_set_header Accept-Language \"\";")
+            appendLine("        proxy_set_header Sec-Fetch-Dest \"\";")
+            appendLine("        proxy_set_header Sec-Fetch-Mode \"\";")
+            appendLine("        proxy_set_header Sec-Fetch-Site \"\";")
+            appendLine("        proxy_set_header Sec-Ch-Ua \"\";")
+            appendLine("        proxy_set_header Host 127.0.0.1;")
+            appendLine("        proxy_http_version 1.1;")
+            appendLine("        proxy_set_header Connection \"\";")
+            appendLine("    }")
+            appendLine()
+            appendLine("    location $paywallLocation {")
+            appendLine("        rewrite ^ /api/enforcement/paywall?siteId=${site.id} break;")
+            appendLine("        proxy_pass http://127.0.0.1:$gatewayPort;")
+            appendLine("        proxy_set_header Host \$host;")
+            appendLine("        proxy_set_header X-Real-IP \$remote_addr;")
+            appendLine("        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;")
+            appendLine("        proxy_set_header X-Forwarded-Proto \$scheme;")
             appendLine("}")
         }
     }

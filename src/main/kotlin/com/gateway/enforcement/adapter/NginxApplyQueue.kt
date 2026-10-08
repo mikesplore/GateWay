@@ -19,12 +19,14 @@ import java.util.concurrent.ConcurrentHashMap
 interface SiteEnforcementStore {
     fun findSite(siteId: UUID): PaymentSite?
     fun allSites(): List<PaymentSite>
+    fun deleteSite(accountId: UUID, siteId: UUID): Boolean
     fun saveApplyResult(siteId: UUID, hash: String?, status: String, error: String?)
     fun expireGraceEntitlements(now: java.time.Instant): List<UUID>
 }
 
 interface NginxDriver {
     fun apply(site: SiteEnforcementConfig, rendered: String): Result<Unit>
+    fun removeManaged(siteId: UUID): Result<Unit>
     fun hasDrift(site: SiteEnforcementConfig, renderedHash: String): Boolean
     fun inspectExternalConfigs(): List<ExternalNginxConfig>
     fun managedOrphans(knownSiteIds: Set<UUID>): List<String>
@@ -99,7 +101,7 @@ class HostNginxDriver(
             val target = File(managedDirectory, "${site.id}.conf")
             val conflicts = findConflicts(host, target)
             require(conflicts.isEmpty()) { "Hostname $host conflicts with ${conflicts.joinToString()}" }
-            site.tlsRef?.let { domain -> certificateProvisioner.ensure(domain)?.let { error(it) } }
+            certificateProvisioner.ensure(site.tlsRef ?: site.hostname)?.let { error(it) }
 
             val staged = File(managedDirectory, ".gateway-stage-${site.id}-${UUID.randomUUID()}")
             val validationLink = File(managedDirectory, "gateway-stage-${UUID.randomUUID()}.conf")
@@ -126,6 +128,41 @@ class HostNginxDriver(
                 throw error
             } finally {
                 Files.deleteIfExists(staged.toPath())
+            }
+        }
+    }
+
+    override fun removeManaged(siteId: UUID): Result<Unit> = synchronized(globalApplyLock) {
+        runCatching {
+            val target = File(managedDirectory, "$siteId.conf")
+            if (!target.exists()) return@runCatching
+            require(target.isFile && !Files.isSymbolicLink(target.toPath())) { "Refusing to delete a non-regular managed Nginx file" }
+            val marker = "# gateway:site:$siteId"
+            require(target.useLines { lines -> lines.take(3).any { it.trim() == marker } }) {
+                "Refusing to delete $target because it is not marked as a Gateway-managed site config"
+            }
+
+            val backup = File(managedDirectory, ".backups/${siteId}-delete-${System.currentTimeMillis()}-${UUID.randomUUID()}").also {
+                it.parentFile.mkdirs()
+                Files.copy(target.toPath(), it.toPath(), StandardCopyOption.COPY_ATTRIBUTES)
+            }
+            try {
+                Files.delete(target.toPath())
+                val validationError = testConfig(File(nginxExecutable))
+                if (validationError != null) error("nginx -t failed after removing the site: ${validationError.take(3000)}")
+                val reloadError = reload()
+                if (reloadError != null) error("Nginx reload failed after removing the site: ${reloadError.take(3000)}")
+                runCatching {
+                    File(managedDirectory, ".backups").listFiles().orEmpty()
+                        .filter { it.isFile && it.name.startsWith("$siteId-") && it.canonicalFile != backup.canonicalFile }
+                        .forEach { Files.deleteIfExists(it.toPath()) }
+                }
+            } catch (error: Throwable) {
+                atomicReplace(backup, target)
+                runCatching { reload() }
+                throw error
+            } finally {
+                Files.deleteIfExists(backup.toPath())
             }
         }
     }
@@ -194,11 +231,14 @@ class NginxApplyQueue(
     private val queue = Channel<UUID>(Channel.UNLIMITED)
     private val queued = ConcurrentHashMap.newKeySet<UUID>()
     private val dirty = ConcurrentHashMap.newKeySet<UUID>()
+    private val removing = ConcurrentHashMap.newKeySet<UUID>()
+    private val siteLocks = ConcurrentHashMap<UUID, Any>()
 
     init { scope.launch { for (siteId in queue) runCatching { process(siteId) } } }
 
     fun enqueue(siteId: UUID) {
         if (!GatewayConfig.nginxEnabled) return
+        if (siteId in removing) return
         if (!queued.add(siteId)) { dirty.add(siteId); return }
         queue.trySend(siteId)
     }
@@ -210,7 +250,7 @@ class NginxApplyQueue(
     fun reconcile(): Int {
         if (!GatewayConfig.nginxEnabled) return 0
         val drifted = store.allSites().filter { site ->
-            runCatching { val config = site.toEnforcementConfig(); val rendered = NginxRenderer.render(config, GatewayConfig.nginxCertificateDirectory); driver.hasDrift(config, NginxRenderer.hash(rendered)) }.getOrDefault(true)
+            runCatching { val config = site.toEnforcementConfig(); val rendered = NginxRenderer.render(config, GatewayConfig.nginxCertificateDirectory, GatewayConfig.port); driver.hasDrift(config, NginxRenderer.hash(rendered)) }.getOrDefault(true)
         }
         drifted.forEach { enqueue(it.id) }
         return drifted.size
@@ -219,11 +259,28 @@ class NginxApplyQueue(
     fun expireGrace(now: java.time.Instant = java.time.Instant.now()): Int =
         store.expireGraceEntitlements(now).onEach(::enqueue).size
 
-    private fun process(siteId: UUID) {
+    fun removeSite(accountId: UUID, siteId: UUID): Result<Unit> = synchronized(siteLocks.computeIfAbsent(siteId) { Any() }) {
+        if (!removing.add(siteId)) return@synchronized Result.failure(IllegalStateException("Site removal is already in progress"))
+        val result = driver.removeManaged(siteId).fold(
+            onSuccess = {
+                if (store.deleteSite(accountId, siteId)) Result.success(Unit)
+                else Result.failure(NoSuchElementException("Site not found"))
+            },
+            onFailure = { Result.failure(it) }
+        )
+        removing.remove(siteId)
+        queued.remove(siteId)
+        dirty.remove(siteId)
+        if (result.isFailure && store.findSite(siteId) != null) enqueue(siteId)
+        result
+    }
+
+    private fun process(siteId: UUID) = synchronized(siteLocks.computeIfAbsent(siteId) { Any() }) {
         try {
+            if (siteId in removing) return
             val site = store.findSite(siteId) ?: return
             val config = site.toEnforcementConfig()
-            val rendered = NginxRenderer.render(config, GatewayConfig.nginxCertificateDirectory)
+            val rendered = NginxRenderer.render(config, GatewayConfig.nginxCertificateDirectory, GatewayConfig.port)
             val hash = NginxRenderer.hash(rendered)
             if (!driver.hasDrift(config, hash)) {
                 store.saveApplyResult(siteId, hash, "applied", null)

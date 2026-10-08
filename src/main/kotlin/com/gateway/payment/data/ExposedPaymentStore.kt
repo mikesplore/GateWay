@@ -404,6 +404,16 @@ class ExposedPaymentStore : PaymentStore, com.gateway.payment.domain.PaymentEven
 
     override fun allSites(): List<PaymentSite> = transaction { Sites.selectAll().map { it.toPaymentSite() } }
 
+    override fun deleteSite(accountId: UUID, siteId: UUID): Boolean = transaction {
+        if (Sites.selectAll().where { (Sites.id eq siteId) and (Sites.accountId eq accountId) }.count() == 0L) return@transaction false
+        // Projects.site_id is a legacy FK with ON DELETE CASCADE. Clear it first
+        // so deleting a site cannot delete its project or detach payment history.
+        Projects.update({ (Projects.siteId eq siteId) and (Projects.accountId eq accountId) }) {
+            it[Projects.siteId] = null
+        }
+        Sites.deleteWhere { (Sites.id eq siteId) and (Sites.accountId eq accountId) } > 0
+    }
+
     override fun updateSite(accountId: UUID, siteId: UUID, hostname: String, upstreamUrl: String?, tlsRef: String?, template: String, projectId: UUID?): PaymentSite? = transaction {
         if (projectId != null) require(Projects.selectAll().where { (Projects.id eq projectId) and (Projects.accountId eq accountId) and (Projects.status neq "archived") }.count() > 0) { "Project not found or archived for account" }
         val changed = Sites.update({ (Sites.id eq siteId) and (Sites.accountId eq accountId) }) {
