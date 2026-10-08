@@ -304,5 +304,5 @@ class NginxApplyQueue(
 }
 
 private fun PaymentSite.toEnforcementConfig() = SiteEnforcementConfig(
-    id, hostname, upstreamUrl, tlsRef, template, EntitlementState.valueOf(entitlementState.uppercase())
+    id, hostname, upstreamUrl, tlsRef, template, EntitlementState.valueOf(effectiveEntitlementState.uppercase())
 )

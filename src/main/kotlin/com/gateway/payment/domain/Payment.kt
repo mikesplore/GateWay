@@ -118,9 +118,24 @@ data class PaymentSite(
     val template: String = "proxy",
     val entitlementState: String = "suspended",
     val stateReason: String = "awaiting_payment",
+    val billingAmount: BigDecimal = BigDecimal.ZERO,
+    val billingCurrency: String = "KES",
+    val manualBlockReason: String? = null,
+    val projectStatus: String = "active",
+    val projectStatusReason: String? = null,
     val stateChangedAt: Instant? = null,
     val stateEffectiveAt: Instant? = null,
     val appliedHash: String? = null,
     val applyStatus: String = "not_configured",
     val lastApplyError: String? = null
-)
+) {
+    val effectiveEntitlementState: String
+        get() = if (projectStatus != "active" || manualBlockReason != null) "suspended" else entitlementState
+    val effectiveStateReason: String
+        get() = when {
+            projectStatus == "suspended" -> projectStatusReason?.takeIf(String::isNotBlank) ?: "project_suspended"
+            projectStatus == "archived" -> projectStatusReason?.takeIf(String::isNotBlank) ?: "project_archived"
+            manualBlockReason != null -> manualBlockReason
+            else -> stateReason
+        }
+}

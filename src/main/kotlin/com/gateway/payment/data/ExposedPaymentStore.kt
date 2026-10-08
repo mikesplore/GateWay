@@ -15,6 +15,8 @@ import com.gateway.payment.domain.ProviderPaymentEvent
 import org.jetbrains.exposed.sql.*
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.lessEq
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.greater
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.isNull
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.neq
 import org.jetbrains.exposed.sql.transactions.transaction
 import java.math.BigDecimal
@@ -380,29 +382,36 @@ class ExposedPaymentStore : PaymentStore, com.gateway.payment.domain.PaymentEven
 
     override fun createSite(accountId: UUID, hostname: String): PaymentSite = createConfiguredSite(accountId, hostname, null, null, "proxy", null)
 
-    override fun createConfiguredSite(accountId: UUID, hostname: String, upstreamUrl: String?, tlsRef: String?, template: String, projectId: UUID?): PaymentSite = transaction {
+    override fun createConfiguredSite(accountId: UUID, hostname: String, upstreamUrl: String?, tlsRef: String?, template: String, projectId: UUID?, billingAmount: BigDecimal, billingCurrency: String): PaymentSite = transaction {
         require(Accounts.selectAll().where { Accounts.id eq accountId }.count() > 0) { "Account not found" }
         if (projectId != null) require(Projects.selectAll().where { (Projects.id eq projectId) and (Projects.accountId eq accountId) and (Projects.status neq "archived") }.count() > 0) { "Project not found or archived for account" }
         val id = UUID.randomUUID(); val now = LocalDateTime.now(ZoneOffset.UTC)
+        val initiallyActive = billingAmount.compareTo(BigDecimal.ZERO) == 0
         Sites.insert {
             it[Sites.id] = id; it[Sites.accountId] = accountId; it[Sites.projectId] = projectId; it[Sites.hostname] = hostname
             it[Sites.upstreamUrl] = upstreamUrl; it[Sites.tlsRef] = tlsRef; it[Sites.template] = template
+            it[Sites.billingAmount] = billingAmount; it[Sites.billingCurrency] = billingCurrency
+            it[Sites.entitlementState] = if (initiallyActive) "active" else "suspended"
+            it[Sites.stateReason] = if (initiallyActive) "no_charge" else "awaiting_payment"
             it[Sites.createdAt] = now; it[Sites.stateChangedAt] = now
             it[Sites.applyStatus] = nextApplyStatus()
         }
         PaymentSite(id, accountId, hostname, now.toInstant(ZoneOffset.UTC), projectId, upstreamUrl, tlsRef, template,
-            stateChangedAt = now.toInstant(ZoneOffset.UTC), applyStatus = nextApplyStatus())
+            entitlementState = if (initiallyActive) "active" else "suspended",
+            stateReason = if (initiallyActive) "no_charge" else "awaiting_payment",
+            billingAmount = billingAmount, billingCurrency = billingCurrency,
+            stateChangedAt = now.toInstant(ZoneOffset.UTC), applyStatus = nextApplyStatus()).withProjectAccess()
     }
 
     override fun listSites(accountId: UUID): List<PaymentSite> = transaction {
-        Sites.selectAll().where { Sites.accountId eq accountId }.orderBy(Sites.createdAt, SortOrder.DESC).map { it.toPaymentSite() }
+        Sites.selectAll().where { Sites.accountId eq accountId }.orderBy(Sites.createdAt, SortOrder.DESC).map { it.toPaymentSite().withProjectAccess() }
     }
 
     override fun findSite(siteId: UUID): PaymentSite? = transaction {
-        Sites.selectAll().where { Sites.id eq siteId }.singleOrNull()?.toPaymentSite()
+        Sites.selectAll().where { Sites.id eq siteId }.singleOrNull()?.toPaymentSite()?.withProjectAccess()
     }
 
-    override fun allSites(): List<PaymentSite> = transaction { Sites.selectAll().map { it.toPaymentSite() } }
+    override fun allSites(): List<PaymentSite> = transaction { Sites.selectAll().map { it.toPaymentSite().withProjectAccess() } }
 
     override fun deleteSite(accountId: UUID, siteId: UUID): Boolean = transaction {
         if (Sites.selectAll().where { (Sites.id eq siteId) and (Sites.accountId eq accountId) }.count() == 0L) return@transaction false
@@ -414,13 +423,34 @@ class ExposedPaymentStore : PaymentStore, com.gateway.payment.domain.PaymentEven
         Sites.deleteWhere { (Sites.id eq siteId) and (Sites.accountId eq accountId) } > 0
     }
 
-    override fun updateSite(accountId: UUID, siteId: UUID, hostname: String, upstreamUrl: String?, tlsRef: String?, template: String, projectId: UUID?): PaymentSite? = transaction {
+    override fun updateSite(accountId: UUID, siteId: UUID, hostname: String, upstreamUrl: String?, tlsRef: String?, template: String, projectId: UUID?, billingAmount: BigDecimal?, billingCurrency: String?): PaymentSite? = transaction {
         if (projectId != null) require(Projects.selectAll().where { (Projects.id eq projectId) and (Projects.accountId eq accountId) and (Projects.status neq "archived") }.count() > 0) { "Project not found or archived for account" }
+        val existing = Sites.selectAll().where { (Sites.id eq siteId) and (Sites.accountId eq accountId) }.singleOrNull() ?: return@transaction null
+        val nextAmount = billingAmount ?: existing[Sites.billingAmount]
+        val nextCurrency = billingCurrency ?: existing[Sites.billingCurrency]
+        val wasFree = existing[Sites.billingAmount].compareTo(BigDecimal.ZERO) == 0
+        val isFree = nextAmount.compareTo(BigDecimal.ZERO) == 0
         val changed = Sites.update({ (Sites.id eq siteId) and (Sites.accountId eq accountId) }) {
             it[Sites.projectId] = projectId; it[Sites.hostname] = hostname; it[Sites.upstreamUrl] = upstreamUrl; it[Sites.tlsRef] = tlsRef; it[Sites.template] = template
+            it[Sites.billingAmount] = nextAmount; it[Sites.billingCurrency] = nextCurrency
+            if (isFree && existing[Sites.stateReason] == "awaiting_payment") {
+                it[Sites.entitlementState] = "active"; it[Sites.stateReason] = "no_charge"; it[Sites.stateEffectiveAt] = null
+            } else if (!isFree && wasFree && existing[Sites.stateReason] == "no_charge") {
+                it[Sites.entitlementState] = "suspended"; it[Sites.stateReason] = "awaiting_payment"; it[Sites.stateEffectiveAt] = LocalDateTime.now(ZoneOffset.UTC)
+            }
             it[Sites.applyStatus] = nextApplyStatus(); it[Sites.lastApplyError] = null
         }
-        if (changed == 0) null else Sites.selectAll().where { Sites.id eq siteId }.single().toPaymentSite()
+        if (changed == 0) null else Sites.selectAll().where { Sites.id eq siteId }.single().toPaymentSite().withProjectAccess()
+    }
+
+    override fun setManualSiteBlock(accountId: UUID, siteId: UUID, reason: String?): Boolean = transaction {
+        if (reason != null) require(reason.isNotBlank() && reason.length <= 256) { "A site block reason is required and must be 256 characters or fewer" }
+        val changed = Sites.update({ (Sites.id eq siteId) and (Sites.accountId eq accountId) }) {
+            it[Sites.manualBlockReason] = reason?.trim()?.takeIf(String::isNotBlank)
+            it[Sites.stateChangedAt] = LocalDateTime.now(ZoneOffset.UTC)
+            it[Sites.applyStatus] = nextApplyStatus(); it[Sites.lastApplyError] = null
+        }
+        changed > 0
     }
 
     override fun setEntitlement(siteId: UUID, state: String, reason: String, effectiveAt: Instant?): Boolean = transaction {
@@ -460,9 +490,18 @@ class ExposedPaymentStore : PaymentStore, com.gateway.payment.domain.PaymentEven
         id = this[Sites.id], accountId = this[Sites.accountId], hostname = this[Sites.hostname],
         createdAt = this[Sites.createdAt].toInstant(ZoneOffset.UTC), upstreamUrl = this[Sites.upstreamUrl], tlsRef = this[Sites.tlsRef],
         projectId = this[Sites.projectId], template = this[Sites.template], entitlementState = this[Sites.entitlementState], stateReason = this[Sites.stateReason],
+        billingAmount = this[Sites.billingAmount], billingCurrency = this[Sites.billingCurrency], manualBlockReason = this[Sites.manualBlockReason],
         stateChangedAt = this[Sites.stateChangedAt]?.toInstant(ZoneOffset.UTC), stateEffectiveAt = this[Sites.stateEffectiveAt]?.toInstant(ZoneOffset.UTC),
         appliedHash = this[Sites.appliedHash], applyStatus = this[Sites.applyStatus], lastApplyError = this[Sites.lastApplyError]
     )
+
+    private fun PaymentSite.withProjectAccess(): PaymentSite {
+        val project = projectId?.let { id -> Projects.selectAll().where { Projects.id eq id }.singleOrNull() }
+        return copy(
+            projectStatus = project?.get(Projects.status) ?: "active",
+            projectStatusReason = project?.get(Projects.statusReason)
+        )
+    }
 
     override fun createProject(accountId: UUID, siteId: UUID, name: String, billingReference: String?): PaymentProject =
         createGroupedProject(accountId, siteId, name, billingReference)
@@ -497,14 +536,6 @@ class ExposedPaymentStore : PaymentStore, com.gateway.payment.domain.PaymentEven
             it[Projects.status] = status; it[Projects.statusReason] = reason?.trim()?.takeIf(String::isNotBlank)?.take(256)
         }
         if (changed == 0) return@transaction null
-        val siteState = if (status == "active") "active" else "suspended"
-        Sites.update({ (Sites.projectId eq projectId) and (Sites.entitlementState neq "disabled_by_admin") }) {
-            it[Sites.entitlementState] = siteState
-            it[Sites.stateReason] = if (status == "active") "project_reactivated" else "project_$status"
-            it[Sites.stateChangedAt] = LocalDateTime.now(ZoneOffset.UTC)
-            it[Sites.stateEffectiveAt] = if (status == "active") null else LocalDateTime.now(ZoneOffset.UTC)
-            it[Sites.applyStatus] = nextApplyStatus(); it[Sites.lastApplyError] = null
-        }
         Projects.selectAll().where { Projects.id eq projectId }.single().toPaymentProject()
     }
 
@@ -644,7 +675,9 @@ class ExposedPaymentStore : PaymentStore, com.gateway.payment.domain.PaymentEven
         if (projectId == null) return
         val project = Projects.selectAll().where { Projects.id eq projectId }.singleOrNull() ?: return
         if (state == "active" && project[Projects.status] != "active") return
-        Sites.update({ (Sites.projectId eq projectId) and (Sites.entitlementState neq "disabled_by_admin") and (Sites.entitlementState neq state) }) {
+        val eligibleSites = (Sites.projectId eq projectId) and Sites.manualBlockReason.isNull() and (Sites.entitlementState neq "disabled_by_admin") and (Sites.entitlementState neq state)
+        val affectedSites = if (state == "suspended") eligibleSites and (Sites.billingAmount greater BigDecimal.ZERO) else eligibleSites
+        Sites.update({ affectedSites }) {
             it[Sites.entitlementState] = state; it[Sites.stateReason] = reason.take(128)
             it[Sites.stateChangedAt] = LocalDateTime.now(ZoneOffset.UTC)
             it[Sites.stateEffectiveAt] = if (state == "active") null else LocalDateTime.now(ZoneOffset.UTC)
