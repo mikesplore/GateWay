@@ -44,6 +44,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import java.math.BigDecimal
@@ -403,7 +405,14 @@ fun Application.configurePaymentRoutes() {
             val account = authenticatedAccount(call.request.headers["Authorization"], humanAuth.session(call.request.cookies["gateway_session"])?.first)
             if (account == null) { call.respond(HttpStatusCode.Unauthorized, ApiError("unauthorized", "A valid merchant API key is required")); return@put }
             val id = runCatching { UUID.fromString(call.parameters["siteId"]) }.getOrNull()
-            val req = runCatching { call.receive<UpdateSiteRequest>() }.getOrNull()
+            val req = runCatching {
+                Json { ignoreUnknownKeys = true; isLenient = true }
+                    .decodeFromString<UpdateSiteRequest>(call.receiveText())
+            }.onFailure { error ->
+                call.application.environment.log.warn(
+                    "Could not decode site update request (content type: ${call.request.headers[io.ktor.http.HttpHeaders.ContentType]}): ${error.message}"
+                )
+            }.getOrNull()
             if (id == null) { call.respond(HttpStatusCode.BadRequest, ApiError("invalid_site_id", "A valid site ID is required")); return@put }
             if (req == null) { call.respond(HttpStatusCode.BadRequest, ApiError("invalid_site_request", "The site settings request could not be read. Refresh the page and try again.")); return@put }
             val hostname = runCatching { SiteInput.hostname(req.hostname) }.getOrNull()
