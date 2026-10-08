@@ -10,6 +10,8 @@ import com.gateway.payment.domain.PaymentEvent
 import com.gateway.payment.domain.PaymentProject
 import com.gateway.payment.domain.PaymentCustomer
 import com.gateway.payment.domain.PaymentSite
+import com.gateway.payment.domain.PublicProjectBilling
+import com.gateway.payment.domain.SiteBalance
 import com.gateway.payment.domain.PaymentStore
 import com.gateway.payment.domain.ProviderPaymentEvent
 import org.jetbrains.exposed.sql.*
@@ -223,9 +225,34 @@ class ExposedPaymentStore : PaymentStore, com.gateway.payment.domain.PaymentEven
         Payments.selectAll().where { (Payments.provider eq provider) and (Payments.providerRequestId eq requestId) }.singleOrNull()?.toPayment()
     }
 
-    override fun reservePayment(accountId: UUID, amount: BigDecimal, currency: String, idempotencyKey: String, projectId: UUID?, requestEmail: String?, phoneNumber: String?, gatewayReference: String?, description: String?): com.gateway.payment.domain.PaymentReservation = transaction {
+    override fun failReservation(reservation: com.gateway.payment.domain.PaymentReservation, message: String) {
+        val id = reservation.reservation ?: return
+        transaction {
+            Payments.update({ (Payments.id eq id) and (Payments.status eq "initializing") }) {
+                it[Payments.status] = "failed"
+                it[Payments.lastProviderError] = message.take(1000)
+                it[Payments.updatedAt] = LocalDateTime.now(ZoneOffset.UTC)
+            }
+        }
+    }
+
+    override fun reservePayment(accountId: UUID, amount: BigDecimal, currency: String, idempotencyKey: String, projectId: UUID?, requestEmail: String?, phoneNumber: String?, gatewayReference: String?, description: String?): com.gateway.payment.domain.PaymentReservation =
+        reservePaymentInternal(accountId, amount, currency, idempotencyKey, projectId, requestEmail, phoneNumber, gatewayReference, description, null)
+
+    override fun reserveSitePayment(accountId: UUID, amount: BigDecimal, currency: String, idempotencyKey: String, projectId: UUID, requestEmail: String?, phoneNumber: String?, gatewayReference: String, description: String?, siteId: UUID): com.gateway.payment.domain.PaymentReservation =
+        reservePaymentInternal(accountId, amount, currency, idempotencyKey, projectId, requestEmail, phoneNumber, gatewayReference, description, siteId)
+
+    private fun reservePaymentInternal(accountId: UUID, amount: BigDecimal, currency: String, idempotencyKey: String, projectId: UUID?, requestEmail: String?, phoneNumber: String?, gatewayReference: String?, description: String?, siteId: UUID?): com.gateway.payment.domain.PaymentReservation = transaction {
         val id = UUID.randomUUID()
         val now = LocalDateTime.now(ZoneOffset.UTC)
+        if (siteId != null) {
+            val siteRow = Sites.selectAll().where { (Sites.id eq siteId) and (Sites.accountId eq accountId) }.singleOrNull()
+                ?: error("Site not found for account")
+            require(siteRow[Sites.projectId] == projectId) { "Site does not belong to this project" }
+            val open = Payments.selectAll().where { (Payments.siteId eq siteId) and (Payments.status inList listOf("initializing", "pending")) }
+                .orderBy(Payments.createdAt, SortOrder.DESC).firstOrNull()
+            if (open != null) return@transaction com.gateway.payment.domain.PaymentReservation(null, open.toPayment())
+        }
         val email = requestEmail?.trim()?.lowercase()?.takeIf(String::isNotBlank)
         val customer = if (email != null || phoneNumber != null) {
             val byEmail = email?.let { value -> Customers.selectAll().where { (Customers.accountId eq accountId) and (Customers.email eq value) }.orderBy(Customers.createdAt).firstOrNull() }
@@ -256,6 +283,7 @@ class ExposedPaymentStore : PaymentStore, com.gateway.payment.domain.PaymentEven
             it[Payments.providerReference] = "reservation:$id"
             it[Payments.gatewayReference] = gatewayReference ?: "reservation:$id"
             it[Payments.projectId] = projectId
+            it[Payments.siteId] = siteId
             it[Payments.customerId] = customer
             it[Payments.amount] = amount
             it[Payments.currency] = currency
@@ -270,6 +298,11 @@ class ExposedPaymentStore : PaymentStore, com.gateway.payment.domain.PaymentEven
         if (inserted.insertedCount == 0) {
             val existing = Payments.selectAll().where { (Payments.accountId eq accountId) and (Payments.idempotencyKey eq idempotencyKey) }.singleOrNull()
             if (existing != null) return@transaction com.gateway.payment.domain.PaymentReservation(null, existing.toPayment())
+            if (siteId != null) {
+                val open = Payments.selectAll().where { (Payments.siteId eq siteId) and (Payments.status inList listOf("initializing", "pending")) }
+                    .orderBy(Payments.createdAt, SortOrder.DESC).firstOrNull()
+                if (open != null) return@transaction com.gateway.payment.domain.PaymentReservation(null, open.toPayment())
+            }
             error("Unable to reserve a unique Gateway payment reference")
         }
         com.gateway.payment.domain.PaymentReservation(id, null)
@@ -404,14 +437,14 @@ class ExposedPaymentStore : PaymentStore, com.gateway.payment.domain.PaymentEven
     }
 
     override fun listSites(accountId: UUID): List<PaymentSite> = transaction {
-        Sites.selectAll().where { Sites.accountId eq accountId }.orderBy(Sites.createdAt, SortOrder.DESC).map { it.toPaymentSite().withProjectAccess() }
+        Sites.selectAll().where { Sites.accountId eq accountId }.orderBy(Sites.createdAt, SortOrder.DESC).map { it.toPaymentSite().withProjectAccess().withBilling() }
     }
 
     override fun findSite(siteId: UUID): PaymentSite? = transaction {
-        Sites.selectAll().where { Sites.id eq siteId }.singleOrNull()?.toPaymentSite()?.withProjectAccess()
+        Sites.selectAll().where { Sites.id eq siteId }.singleOrNull()?.toPaymentSite()?.withProjectAccess()?.withBilling()
     }
 
-    override fun allSites(): List<PaymentSite> = transaction { Sites.selectAll().map { it.toPaymentSite().withProjectAccess() } }
+    override fun allSites(): List<PaymentSite> = transaction { Sites.selectAll().map { it.toPaymentSite().withProjectAccess().withBilling() } }
 
     override fun deleteSite(accountId: UUID, siteId: UUID): Boolean = transaction {
         if (Sites.selectAll().where { (Sites.id eq siteId) and (Sites.accountId eq accountId) }.count() == 0L) return@transaction false
@@ -427,19 +460,25 @@ class ExposedPaymentStore : PaymentStore, com.gateway.payment.domain.PaymentEven
         if (projectId != null) require(Projects.selectAll().where { (Projects.id eq projectId) and (Projects.accountId eq accountId) and (Projects.status neq "archived") }.count() > 0) { "Project not found or archived for account" }
         val existing = Sites.selectAll().where { (Sites.id eq siteId) and (Sites.accountId eq accountId) }.singleOrNull() ?: return@transaction null
         val nextAmount = billingAmount ?: existing[Sites.billingAmount]
-        val wasFree = existing[Sites.billingAmount].compareTo(BigDecimal.ZERO) == 0
-        val isFree = nextAmount.compareTo(BigDecimal.ZERO) == 0
+        val paid = Payments.select(Payments.amount).where {
+            (Payments.siteId eq siteId) and (Payments.status eq "succeeded")
+        }.fold(BigDecimal.ZERO) { total, payment -> total + payment[Payments.amount] }
+        val hasOutstandingBalance = nextAmount > paid
+        val existingReason = existing[Sites.stateReason]
+        val paymentManagedState = existingReason == "awaiting_payment" || existingReason == "no_charge" || existingReason.startsWith("payment_succeeded:") || existingReason.startsWith("payment_reversed:")
         val changed = Sites.update({ (Sites.id eq siteId) and (Sites.accountId eq accountId) }) {
             it[Sites.projectId] = projectId; it[Sites.hostname] = hostname; it[Sites.upstreamUrl] = upstreamUrl; it[Sites.tlsRef] = tlsRef; it[Sites.template] = template
             it[Sites.billingAmount] = nextAmount
-            if (isFree && existing[Sites.stateReason] == "awaiting_payment") {
-                it[Sites.entitlementState] = "active"; it[Sites.stateReason] = "no_charge"; it[Sites.stateEffectiveAt] = null
-            } else if (!isFree && wasFree && existing[Sites.stateReason] == "no_charge") {
-                it[Sites.entitlementState] = "suspended"; it[Sites.stateReason] = "awaiting_payment"; it[Sites.stateEffectiveAt] = LocalDateTime.now(ZoneOffset.UTC)
+            if (billingAmount != null && paymentManagedState && existing[Sites.manualBlockReason] == null && existing[Sites.entitlementState] != "disabled_by_admin") {
+                if (hasOutstandingBalance) {
+                    it[Sites.entitlementState] = "suspended"; it[Sites.stateReason] = "awaiting_payment"; it[Sites.stateEffectiveAt] = LocalDateTime.now(ZoneOffset.UTC)
+                } else {
+                    it[Sites.entitlementState] = "active"; it[Sites.stateReason] = if (nextAmount == BigDecimal.ZERO) "no_charge" else "payment_succeeded:site_balance"; it[Sites.stateEffectiveAt] = null
+                }
             }
             it[Sites.applyStatus] = nextApplyStatus(); it[Sites.lastApplyError] = null
         }
-        if (changed == 0) null else Sites.selectAll().where { Sites.id eq siteId }.single().toPaymentSite().withProjectAccess()
+        if (changed == 0) null else Sites.selectAll().where { Sites.id eq siteId }.single().toPaymentSite().withProjectAccess().withBilling()
     }
 
     override fun setManualSiteBlock(accountId: UUID, siteId: UUID, reason: String?): Boolean = transaction {
@@ -502,6 +541,13 @@ class ExposedPaymentStore : PaymentStore, com.gateway.payment.domain.PaymentEven
         )
     }
 
+    private fun PaymentSite.withBilling(): PaymentSite {
+        val paid = Payments.select(Payments.amount).where {
+            (Payments.siteId eq id) and (Payments.status eq "succeeded")
+        }.fold(BigDecimal.ZERO) { total, payment -> total + payment[Payments.amount] }
+        return copy(amountPaid = paid)
+    }
+
     override fun createProject(accountId: UUID, siteId: UUID, name: String, billingReference: String?): PaymentProject =
         createGroupedProject(accountId, siteId, name, billingReference)
 
@@ -523,6 +569,44 @@ class ExposedPaymentStore : PaymentStore, com.gateway.payment.domain.PaymentEven
 
     override fun projectAcceptsPayments(projectId: UUID): Boolean = transaction {
         Projects.selectAll().where { (Projects.id eq projectId) and (Projects.status neq "archived") }.count() > 0
+    }
+
+    override fun openSitePayment(siteId: UUID): Payment? = transaction {
+        Payments.selectAll().where { (Payments.siteId eq siteId) and (Payments.status inList listOf("initializing", "pending")) }
+            .orderBy(Payments.createdAt, SortOrder.DESC).firstOrNull()?.toPayment()
+    }
+
+    override fun publicProjectBilling(siteId: UUID): PublicProjectBilling? = transaction {
+        val currentRow = Sites.selectAll().where { Sites.id eq siteId }.singleOrNull() ?: return@transaction null
+        val projectId = currentRow[Sites.projectId] ?: return@transaction null
+        val projectRow = Projects.selectAll().where { Projects.id eq projectId }.singleOrNull() ?: return@transaction null
+        val project = projectRow.toPaymentProject()
+        val siteRows = Sites.selectAll().where { Sites.projectId eq projectId }.orderBy(Sites.hostname).toList()
+        if (siteRows.isEmpty()) return@transaction null
+        val siteIds = siteRows.map { it[Sites.id] }
+        val paidBySite = Payments.select(Payments.siteId, Payments.amount).where {
+            (Payments.siteId inList siteIds) and (Payments.status eq "succeeded")
+        }.groupBy { it[Payments.siteId]!! }.mapValues { (_, rows) -> rows.fold(BigDecimal.ZERO) { total, row -> total + row[Payments.amount] } }
+        val balances = siteRows.map { row ->
+            val paid = paidBySite[row[Sites.id]] ?: BigDecimal.ZERO
+            val due = (row[Sites.billingAmount] - paid).max(BigDecimal.ZERO)
+            val state = when {
+                project.status != "active" || row[Sites.manualBlockReason] != null -> "suspended"
+                else -> row[Sites.entitlementState]
+            }
+            SiteBalance(row[Sites.id], row[Sites.hostname], state, due)
+        }
+        val currentBalance = balances.firstOrNull { it.siteId == siteId } ?: return@transaction null
+        val reason = when {
+            project.status != "active" -> project.statusReason?.takeIf(String::isNotBlank) ?: "project_${project.status}"
+            currentRow[Sites.manualBlockReason] != null -> currentRow[Sites.manualBlockReason]
+            else -> currentRow[Sites.stateReason]
+        }
+        PublicProjectBilling(
+            projectId, project.name, project.status, project.statusReason,
+            siteId, currentRow[Sites.hostname], currentBalance.entitlementState, reason,
+            currentBalance.amountDue, balances.fold(BigDecimal.ZERO) { total, balance -> total + balance.amountDue }, balances
+        )
     }
 
     fun findProject(accountId: UUID, projectId: UUID): PaymentProject? = transaction {
@@ -643,8 +727,8 @@ class ExposedPaymentStore : PaymentStore, com.gateway.payment.domain.PaymentEven
                 it[Payments.lastProviderError] = null
             }
             when (event.status) {
-                PaymentStatus.SUCCEEDED -> setProjectEntitlement(row[Payments.projectId], "active", "payment_succeeded:${row[Payments.gatewayReference]}")
-                PaymentStatus.REVERSED -> setProjectEntitlement(row[Payments.projectId], "suspended", "payment_reversed:${row[Payments.gatewayReference]}")
+                PaymentStatus.SUCCEEDED -> refreshPaymentEntitlement(row, "payment_succeeded:${row[Payments.gatewayReference]}", "active")
+                PaymentStatus.REVERSED -> refreshPaymentEntitlement(row, "payment_reversed:${row[Payments.gatewayReference]}", "suspended")
                 else -> Unit
             }
             return true
@@ -663,8 +747,8 @@ class ExposedPaymentStore : PaymentStore, com.gateway.payment.domain.PaymentEven
             it[PaymentStatusHistory.occurredAt] = LocalDateTime.now(ZoneOffset.UTC)
         }
         when (event.status) {
-            PaymentStatus.SUCCEEDED -> setProjectEntitlement(row[Payments.projectId], "active", "payment_succeeded:${row[Payments.gatewayReference]}")
-            PaymentStatus.REVERSED -> setProjectEntitlement(row[Payments.projectId], "suspended", "payment_reversed:${row[Payments.gatewayReference]}")
+            PaymentStatus.SUCCEEDED -> refreshPaymentEntitlement(row, "payment_succeeded:${row[Payments.gatewayReference]}", "active")
+            PaymentStatus.REVERSED -> refreshPaymentEntitlement(row, "payment_reversed:${row[Payments.gatewayReference]}", "suspended")
             else -> Unit
         }
         return true
@@ -680,6 +764,32 @@ class ExposedPaymentStore : PaymentStore, com.gateway.payment.domain.PaymentEven
             it[Sites.entitlementState] = state; it[Sites.stateReason] = reason.take(128)
             it[Sites.stateChangedAt] = LocalDateTime.now(ZoneOffset.UTC)
             it[Sites.stateEffectiveAt] = if (state == "active") null else LocalDateTime.now(ZoneOffset.UTC)
+            it[Sites.applyStatus] = nextApplyStatus(); it[Sites.lastApplyError] = null
+        }
+    }
+
+    private fun refreshPaymentEntitlement(row: ResultRow, reason: String, fallbackState: String) {
+        val siteId = row[Payments.siteId]
+        if (siteId == null) {
+            setProjectEntitlement(row[Payments.projectId], fallbackState, reason)
+            return
+        }
+        val site = Sites.selectAll().where { Sites.id eq siteId }.singleOrNull() ?: return
+        if (site[Sites.manualBlockReason] != null || site[Sites.entitlementState] == "disabled_by_admin") return
+        val currentReason = site[Sites.stateReason]
+        val paymentManagedState = currentReason == "awaiting_payment" || currentReason == "no_charge" || currentReason.startsWith("payment_succeeded:") || currentReason.startsWith("payment_reversed:")
+        if (!paymentManagedState) return
+        val paid = Payments.select(Payments.amount).where {
+            (Payments.siteId eq siteId) and (Payments.status eq "succeeded")
+        }.fold(BigDecimal.ZERO) { total, payment -> total + payment[Payments.amount] }
+        val hasOutstandingBalance = (site[Sites.billingAmount] - paid) > BigDecimal.ZERO
+        val nextState = if (hasOutstandingBalance) "suspended" else "active"
+        val nextReason = if (hasOutstandingBalance) "awaiting_payment" else reason.take(128)
+        Sites.update({ Sites.id eq siteId }) {
+            it[Sites.entitlementState] = nextState
+            it[Sites.stateReason] = nextReason
+            it[Sites.stateChangedAt] = LocalDateTime.now(ZoneOffset.UTC)
+            it[Sites.stateEffectiveAt] = if (nextState == "active") null else LocalDateTime.now(ZoneOffset.UTC)
             it[Sites.applyStatus] = nextApplyStatus(); it[Sites.lastApplyError] = null
         }
     }
@@ -702,6 +812,6 @@ class ExposedPaymentStore : PaymentStore, com.gateway.payment.domain.PaymentEven
         providerReference = this[Payments.providerReference], gatewayReference = this[Payments.gatewayReference] ?: this[Payments.providerReference], amount = this[Payments.amount], currency = this[Payments.currency],
         status = runCatching { PaymentStatus.valueOf(this[Payments.status].uppercase()) }.getOrDefault(PaymentStatus.PENDING),
         checkoutUrl = this[Payments.checkoutUrl], createdAt = this[Payments.createdAt].toInstant(ZoneOffset.UTC),
-        paidAt = this[Payments.paidAt]?.toInstant(ZoneOffset.UTC), projectId = this[Payments.projectId], providerTransactionId = this[Payments.providerTransactionId], providerRequestId = this[Payments.providerRequestId], customerPhone = this[Payments.customerPhone], nextReconciliationAt = this[Payments.nextReconciliationAt]?.toInstant(ZoneOffset.UTC), reconciliationAttempts = this[Payments.reconciliationAttempts], lastProviderError = this[Payments.lastProviderError], requestEmail = this[Payments.requestEmail], description = this[Payments.description], customerId = this[Payments.customerId]
+        paidAt = this[Payments.paidAt]?.toInstant(ZoneOffset.UTC), projectId = this[Payments.projectId], providerTransactionId = this[Payments.providerTransactionId], providerRequestId = this[Payments.providerRequestId], customerPhone = this[Payments.customerPhone], nextReconciliationAt = this[Payments.nextReconciliationAt]?.toInstant(ZoneOffset.UTC), reconciliationAttempts = this[Payments.reconciliationAttempts], lastProviderError = this[Payments.lastProviderError], requestEmail = this[Payments.requestEmail], description = this[Payments.description], customerId = this[Payments.customerId], siteId = this[Payments.siteId]
     )
 }

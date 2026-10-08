@@ -77,6 +77,7 @@ object Payments : Table("payments") {
     val accountId = uuid("account_id")
     val projectId = uuid("project_id").nullable()
     val customerId = uuid("customer_id").nullable()
+    val siteId = uuid("site_id").nullable()
     val provider = varchar("provider", 32)
     val providerReference = varchar("provider_reference", 128)
     val gatewayReference = varchar("gateway_reference", 128)

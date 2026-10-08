@@ -25,14 +25,21 @@ class ProviderPaymentService(private val payments: PaymentStore, private val pro
         if (command.projectId != null && !payments.projectAcceptsPayments(command.projectId)) return Result.failure(IllegalArgumentException("Archived projects cannot receive payments"))
         val reference = command.gatewayReference ?: "gw_${java.util.UUID.randomUUID().toString().replace("-", "")}" 
         val idempotencyKey = "${provider.name}:${command.idempotencyKey ?: reference}"
-        val reservation = payments.reservePayment(command.accountId, command.amount.setScale(2), command.currency.uppercase(), idempotencyKey, command.projectId, command.email.takeIf(String::isNotBlank), command.phoneNumber, reference, command.description?.take(256))
+        val reservation = if (command.siteId == null) {
+            payments.reservePayment(command.accountId, command.amount.setScale(2), command.currency.uppercase(), idempotencyKey, command.projectId, command.email.takeIf(String::isNotBlank), command.phoneNumber, reference, command.description?.take(256))
+        } else {
+            payments.reserveSitePayment(command.accountId, amount = command.amount.setScale(2), currency = command.currency.uppercase(), idempotencyKey = idempotencyKey, projectId = requireNotNull(command.projectId), requestEmail = command.email.takeIf(String::isNotBlank), phoneNumber = command.phoneNumber, gatewayReference = reference, description = command.description?.take(256), siteId = requireNotNull(command.siteId))
+        }
         reservation.existing?.let { existing ->
-            if (existing.amount.compareTo(command.amount) != 0 || !existing.currency.equals(command.currency, true) || existing.projectId != command.projectId || existing.customerPhone != command.phoneNumber || existing.requestEmail != command.email.takeIf(String::isNotBlank) || existing.description != command.description?.take(256)) return Result.failure(IllegalArgumentException("Idempotency key was already used with different payment details"))
+            if (existing.amount.compareTo(command.amount) != 0 || !existing.currency.equals(command.currency, true) || existing.projectId != command.projectId || existing.siteId != command.siteId || existing.provider != provider.name || existing.customerPhone != command.phoneNumber || existing.requestEmail != command.email.takeIf(String::isNotBlank) || existing.description != command.description?.take(256)) return Result.failure(IllegalArgumentException("Idempotency key was already used with different payment details"))
             if (existing.status == PaymentStatus.INITIALIZING || existing.providerReference.startsWith("reservation:")) return Result.failure(IllegalStateException("Payment initiation outcome is still being recovered"))
             return Result.success(existing)
         }
         val normalized = command.copy(currency = command.currency.uppercase(), gatewayReference = reference)
-        val initiated = provider.initiate(normalized).getOrElse { return Result.failure(it) }
+        val initiated = provider.initiate(normalized).getOrElse {
+            payments.failReservation(reservation, it.message ?: "Provider could not initialize payment")
+            return Result.failure(it)
+        }
         return runCatching {
             payments.completeReservation(reservation, provider.name, initiated.reference, initiated.checkoutUrl, initiated.providerRequestId ?: initiated.providerTransactionId, reference)
         }
@@ -44,6 +51,9 @@ interface PaymentStore : AccountStore {
     fun findByGatewayReference(reference: String): Payment?
     fun findByProviderRequestId(provider: String, requestId: String): Payment?
     fun reservePayment(accountId: java.util.UUID, amount: java.math.BigDecimal, currency: String, idempotencyKey: String, projectId: java.util.UUID? = null, requestEmail: String? = null, phoneNumber: String? = null, gatewayReference: String? = null, description: String? = null): PaymentReservation
+    fun reserveSitePayment(accountId: java.util.UUID, amount: java.math.BigDecimal, currency: String, idempotencyKey: String, projectId: java.util.UUID, requestEmail: String?, phoneNumber: String?, gatewayReference: String, description: String?, siteId: java.util.UUID): PaymentReservation =
+        reservePayment(accountId, amount, currency, idempotencyKey, projectId, requestEmail, phoneNumber, gatewayReference, description)
+    fun failReservation(reservation: PaymentReservation, message: String) = Unit
     fun completeReservation(reservation: PaymentReservation, provider: String, reference: String, checkoutUrl: String?, providerRequestId: String? = null, gatewayReference: String = reference): Payment
     fun listPayments(accountId: java.util.UUID, status: PaymentStatus? = null, provider: String? = null, currency: String? = null, projectId: java.util.UUID? = null, from: java.time.Instant? = null, to: java.time.Instant? = null, limit: Int = 50, offset: Int = 0): List<Payment>
     fun paymentTotals(accountId: java.util.UUID): PaymentTotals
@@ -67,6 +77,8 @@ interface PaymentStore : AccountStore {
     fun listProjects(accountId: java.util.UUID): List<PaymentProject>
     fun projectBelongsToAccount(projectId: java.util.UUID, accountId: java.util.UUID): Boolean
     fun projectAcceptsPayments(projectId: java.util.UUID): Boolean = true
+    fun publicProjectBilling(siteId: java.util.UUID): PublicProjectBilling? = null
+    fun openSitePayment(siteId: java.util.UUID): Payment? = null
     fun recordReconciliationFailure(paymentId: java.util.UUID, error: String, nextAttemptAt: java.time.Instant)
     fun releaseReconciliationClaim(paymentId: java.util.UUID)
 }

@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Payment required</title>
+  <style>
+    :root { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #172033; background: #f3f6fa; font-synthesis: none; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; padding: 32px 16px; display: grid; place-items: center; }
+    main { width: min(100%, 760px); }
+    .brand { display: flex; align-items: center; gap: 10px; margin: 0 0 18px 4px; font-size: 14px; font-weight: 700; color: #475569; letter-spacing: .02em; }
+    .brand-mark { width: 30px; height: 30px; display: grid; place-items: center; border-radius: 9px; color: white; background: #059669; }
+    .card { background: #fff; border: 1px solid #e2e8f0; border-radius: 20px; box-shadow: 0 18px 50px #13213a12; overflow: hidden; }
+    .intro { padding: 32px 34px 26px; background: linear-gradient(135deg, #ecfdf5, #fff 72%); }
+    .eyebrow { margin: 0 0 10px; color: #047857; font-size: 11px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; }
+    h1 { margin: 0; font-size: clamp(25px, 5vw, 36px); line-height: 1.15; letter-spacing: -.035em; }
+    .subtitle { margin: 10px 0 0; color: #64748b; line-height: 1.6; }
+    .content { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; padding: 26px 34px 32px; }
+    h2 { margin: 0 0 13px; font-size: 14px; }
+    .project-line { display:flex; justify-content:space-between; gap:12px; padding: 10px 0; border-bottom:1px solid #edf1f5; font-size:13px; }
+    .project-line span:first-child { color:#64748b; }
+    .project-line strong { text-align:right; }
+    .balance { margin-top: 17px; padding: 16px; border-radius: 13px; background:#f8fafc; }
+    .balance-label { color:#64748b; font-size:11px; font-weight:700; letter-spacing:.08em; text-transform:uppercase; }
+    .balance-amount { margin-top:5px; font-size:25px; font-weight:750; letter-spacing:-.03em; }
+    .sites { display:grid; gap:8px; margin:14px 0 0; padding:0; list-style:none; }
+    .site-row { display:flex; justify-content:space-between; gap:10px; align-items:center; padding:10px 12px; border:1px solid #e8edf2; border-radius:11px; font-size:12px; }
+    .site-host { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:600; }
+    .site-amount { white-space:nowrap; color:#475569; }
+    .form-wrap { padding:18px; border:1px solid #e2e8f0; border-radius:15px; }
+    .methods { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:15px; }
+    .method { display:flex; align-items:center; gap:8px; min-height:42px; padding:9px 10px; border:1px solid #dbe3ea; border-radius:10px; cursor:pointer; font-size:12px; font-weight:650; }
+    .method:has(input:checked) { border-color:#10b981; background:#ecfdf5; }
+    label.field { display:block; margin-top:12px; color:#475569; font-size:12px; font-weight:650; }
+    input[type=email], input[type=tel] { width:100%; margin-top:6px; padding:12px; border:1px solid #cbd5e1; border-radius:9px; outline:none; font:inherit; font-size:14px; }
+    input:focus { border-color:#10b981; box-shadow:0 0 0 3px #10b98120; }
+    button { width:100%; min-height:45px; margin-top:16px; border:0; border-radius:10px; color:#fff; background:#059669; font:inherit; font-size:14px; font-weight:700; cursor:pointer; }
+    button:hover { background:#047857; }
+    button:disabled { opacity:.55; cursor:not-allowed; }
+    .notice { display:none; margin-top:13px; padding:11px 12px; border-radius:9px; color:#334155; background:#f1f5f9; font-size:12px; line-height:1.5; }
+    .notice.show { display:block; }
+    .notice.error { color:#991b1b; background:#fef2f2; }
+    .notice.success { color:#065f46; background:#ecfdf5; }
+    .fineprint { margin:12px 2px 0; color:#94a3b8; font-size:11px; line-height:1.5; }
+    .full { grid-column:1/-1; }
+    .hidden { display:none!important; }
+    @media (max-width:640px) { body { padding:18px 12px; } .intro { padding:25px 22px 20px; } .content { grid-template-columns:1fr; padding:20px 22px 24px; } }
+  </style>
+</head>
+<body>
+<main>
+  <div class="brand"><span class="brand-mark">G</span> GateWay secure payments</div>
+  <div class="card">
+    <header class="intro">
+      <p class="eyebrow">Project access</p>
+      <h1 id="title">Payment required</h1>
+      <p class="subtitle" id="subtitle">Loading the project billing details…</p>
+    </header>
+    <div class="content">
+      <section>
+        <h2>Project summary</h2>
+        <div class="project-line"><span>Project</span><strong id="project-name">—</strong></div>
+        <div class="project-line"><span>Project status</span><strong id="project-status">—</strong></div>
+        <div class="project-line"><span>Current site</span><strong id="site-host">—</strong></div>
+        <div class="balance"><div class="balance-label">Current site amount due</div><div class="balance-amount" id="site-due">—</div></div>
+        <div class="project-line"><span>All project sites due</span><strong id="project-due">—</strong></div>
+        <ul class="sites" id="site-list"></ul>
+      </section>
+      <section>
+        <h2>Pay securely</h2>
+        <div class="form-wrap" id="payment-box">
+          <form id="payment-form">
+            <div class="methods">
+              <label class="method"><input type="radio" name="provider" value="mpesa" checked> M-Pesa STK Push</label>
+              <label class="method"><input type="radio" name="provider" value="paystack"> Paystack</label>
+            </div>
+            <label class="field" id="phone-field">M-Pesa phone number
+              <input id="phone" type="tel" inputmode="tel" autocomplete="tel" placeholder="07xx xxx xxx" maxlength="24">
+            </label>
+            <label class="field hidden" id="email-field">Email for Paystack receipt
+              <input id="email" type="email" autocomplete="email" placeholder="you@example.com" maxlength="320">
+            </label>
+            <button id="pay-button" type="submit" disabled>Continue to payment</button>
+          </form>
+          <div class="notice" id="notice" role="status" aria-live="polite"></div>
+          <p class="fineprint">The amount is calculated by the site owner and confirmed by GateWay. Access changes only after the payment provider confirms payment.</p>
+        </div>
+      </section>
+      <div class="full notice" id="project-warning"></div>
+    </div>
+  </div>
+</main>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const formatMoney = value => new Intl.NumberFormat('en-KE', { style: 'currency', currency: 'KES' }).format(Number(value || 0));
+  const state = { siteId: null, due: 0, paymentRef: null, timer: null };
+  const notice = (message, kind = '') => { const el = $('notice'); el.textContent = message; el.className = `notice show ${kind}`; };
+  async function api(path, options = {}) {
+    const response = await fetch(path, { ...options, headers: { Accept: 'application/json', ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...(options.headers || {}) }, cache: 'no-store' });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.message || 'Could not load payment information.');
+    return data;
+  }
+  function render(data) {
+    const project = data.project;
+    const site = data.site;
+    state.siteId = site.id;
+    state.due = Number(site.amountDue || 0);
+    $('project-name').textContent = project.name;
+    $('project-status').textContent = project.status[0].toUpperCase() + project.status.slice(1);
+    $('site-host').textContent = site.hostname;
+    $('site-due').textContent = formatMoney(state.due);
+    $('project-due').textContent = formatMoney(project.totalDue);
+    $('title').textContent = state.due > 0 ? 'Payment required to access this site' : 'Site access is restricted';
+    $('subtitle').textContent = `${site.hostname} is managed under ${project.name}. Pay the outstanding site amount below; no amount is taken from the browser.`;
+    const list = $('site-list');
+    list.replaceChildren();
+    for (const item of project.sites) {
+      const li = document.createElement('li'); li.className = 'site-row';
+      const host = document.createElement('span'); host.className = 'site-host'; host.textContent = item.hostname;
+      const due = document.createElement('span'); due.className = 'site-amount'; due.textContent = `${formatMoney(item.amountDue)} due`;
+      li.append(host, due); list.append(li);
+    }
+    const warnings = [];
+    if (project.status !== 'active') warnings.push(`This project is ${project.status}. Paying site balances does not remove this project-level restriction${project.statusReason ? `: ${project.statusReason}` : ''}. Contact the project owner.`);
+    if (site.status === 'suspended' && site.statusReason && !site.statusReason.includes('awaiting_payment') && project.status === 'active') warnings.push(`Site access note: ${site.statusReason}`);
+    if (warnings.length) { $('project-warning').textContent = warnings.join(' '); $('project-warning').className = 'full notice show'; }
+    const canPay = state.due > 0 && project.status !== 'archived';
+    $('pay-button').disabled = !canPay;
+    if (!canPay) {
+      $('payment-form').classList.add('hidden');
+      if (state.due <= 0) notice('There is no outstanding amount for this site. If access remains restricted, contact the project owner.', 'error');
+      else notice('This project is archived and cannot accept payments.', 'error');
+    }
+  }
+  async function checkPayment() {
+    if (!state.paymentRef) return;
+    try {
+      const payment = await api(`/_gateway/payments/${encodeURIComponent(state.paymentRef)}`);
+      if (payment.status === 'succeeded') {
+        clearInterval(state.timer);
+        notice('Payment confirmed. Site access is being updated. Returning to the site…', 'success');
+        $('pay-button').disabled = true;
+        setTimeout(() => { window.location.assign('/'); }, 2200);
+      } else if (['failed', 'reversed', 'expired'].includes(payment.status)) {
+        clearInterval(state.timer);
+        notice('The provider did not confirm this payment. Your site remains protected; you can try again.', 'error');
+        $('pay-button').disabled = false;
+      } else {
+        notice(payment.provider === 'mpesa' ? 'Check your phone and enter your M-Pesa PIN to approve the prompt. This page will update when Safaricom confirms it.' : 'Payment is being verified securely by the provider. This page will update when confirmation arrives.');
+      }
+    } catch (error) { notice(error.message || 'Payment status is temporarily unavailable.'); }
+  }
+  document.querySelectorAll('input[name="provider"]').forEach(input => input.addEventListener('change', () => {
+    const paystack = document.querySelector('input[name="provider"]:checked').value === 'paystack';
+    $('phone-field').classList.toggle('hidden', paystack);
+    $('email-field').classList.toggle('hidden', !paystack);
+  }));
+  $('payment-form').addEventListener('submit', async event => {
+    event.preventDefault();
+    const provider = document.querySelector('input[name="provider"]:checked').value;
+    const button = $('pay-button'); button.disabled = true; button.textContent = 'Starting secure payment…';
+    try {
+      const body = { provider, idempotencyKey: crypto.randomUUID() };
+      if (provider === 'mpesa') body.phoneNumber = $('phone').value.trim();
+      else body.email = $('email').value.trim();
+      const payment = await api('/_gateway/payments', { method: 'POST', body: JSON.stringify(body) });
+      if (payment.checkoutUrl) {
+        const checkout = new URL(payment.checkoutUrl);
+        if (checkout.protocol !== 'https:' || checkout.hostname !== 'checkout.paystack.com') throw new Error('Paystack returned an unexpected checkout address.');
+        window.location.assign(checkout.toString()); return;
+      }
+      state.paymentRef = payment.reference;
+      button.textContent = 'Payment pending';
+      notice('M-Pesa prompt sent. Approve it on your phone; payment is confirmed by Safaricom, not by this page.');
+      await checkPayment();
+      state.timer = setInterval(checkPayment, 3000);
+    } catch (error) {
+      notice(error.message || 'Could not start payment. Please try again.', 'error');
+      button.disabled = state.due <= 0;
+      button.textContent = 'Try payment again';
+    }
+  });
+  (async () => {
+    const paymentRef = new URLSearchParams(window.location.search).get('gateway_payment');
+    try {
+      const data = await api('/_gateway/payment-info');
+      render(data);
+      if (paymentRef) { state.paymentRef = paymentRef; await checkPayment(); state.timer = setInterval(checkPayment, 3000); }
+    } catch (error) { $('subtitle').textContent = error.message || 'Project billing details are unavailable. Contact the site owner.'; $('payment-form').classList.add('hidden'); }
+  })();
+})();
+</script>
+</body>
+</html>

@@ -28,6 +28,7 @@ import io.ktor.server.application.Application
 import io.ktor.server.request.receiveText
 import io.ktor.server.request.receive
 import io.ktor.server.response.respond
+import io.ktor.server.response.respondRedirect
 import io.ktor.server.response.respondText
 import io.ktor.server.routing.get
 import io.ktor.server.routing.delete
@@ -109,6 +110,7 @@ fun Application.configurePaymentRoutes() {
             val site = siteId?.let(store::findSite)
             val hostname = site?.hostname ?: "this site"
             call.response.headers.append(io.ktor.http.HttpHeaders.CacheControl, "no-store")
+            call.response.headers.append("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
             val acceptsJson = call.request.headers[io.ktor.http.HttpHeaders.Accept]
                 ?.contains("application/json", ignoreCase = true) == true
             if (acceptsJson) {
@@ -118,9 +120,57 @@ fun Application.configurePaymentRoutes() {
                     HttpStatusCode.PaymentRequired
                 )
             } else {
-                val body = "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Payment required</title></head><body><main><h1>Payment required</h1><p>Access to $hostname is currently unavailable. Contact the site owner.</p></main></body></html>"
-                call.respondText(body, ContentType.Text.Html, HttpStatusCode.PaymentRequired)
+                call.respondText(PublicPaymentPage.html, ContentType.Text.Html, HttpStatusCode.PaymentRequired)
             }
+        }
+        get("/api/public/sites/{siteId}") {
+            val siteId = runCatching { UUID.fromString(call.parameters["siteId"]) }.getOrNull()
+            val billing = siteId?.let(store::publicProjectBilling)
+            if (billing == null) { call.respond(HttpStatusCode.NotFound, ApiError("site_billing_not_found", "Billing details for this site are unavailable")); return@get }
+            call.response.headers.append(io.ktor.http.HttpHeaders.CacheControl, "no-store")
+            call.respond(PublicSiteBillingResponse.from(billing))
+        }
+        post("/api/public/sites/{siteId}/payments") {
+            val siteId = runCatching { UUID.fromString(call.parameters["siteId"]) }.getOrNull()
+            if (siteId == null) { call.respond(HttpStatusCode.NotFound, ApiError("site_billing_not_found", "Billing details for this site are unavailable")); return@post }
+            val request = runCatching { call.receive<PublicSitePaymentRequest>() }.getOrNull()
+            if (request == null) { call.respond(HttpStatusCode.BadRequest, ApiError("invalid_payment", "Choose a payment method and provide its required customer details")); return@post }
+            val billing = store.publicProjectBilling(siteId)
+            val site = store.findSite(siteId)
+            if (billing == null || site == null || site.projectId == null) { call.respond(HttpStatusCode.NotFound, ApiError("site_billing_not_found", "Billing details for this site are unavailable")); return@post }
+            store.openSitePayment(siteId)?.let { pending ->
+                call.response.headers.append(io.ktor.http.HttpHeaders.CacheControl, "no-store")
+                call.respond(HttpStatusCode.OK, PublicSitePaymentResponse.from(pending)); return@post
+            }
+            if (billing.projectStatus == "archived") { call.respond(HttpStatusCode.Conflict, ApiError("project_archived", "Archived projects cannot receive payments")); return@post }
+            if (billing.currentSiteAmountDue <= BigDecimal.ZERO) { call.respond(HttpStatusCode.Conflict, ApiError("no_amount_due", "There is no outstanding amount for this site")); return@post }
+            val paymentProvider = request.provider.trim().lowercase()
+            if (paymentProvider !in setOf("mpesa", "paystack")) { call.respond(HttpStatusCode.BadRequest, ApiError("unsupported_payment_method", "Choose M-Pesa or Paystack")); return@post }
+            if ((request.email?.length ?: 0) > 320 || (request.phoneNumber?.length ?: 0) > 24) { call.respond(HttpStatusCode.BadRequest, ApiError("invalid_customer_details", "Customer contact details are too long")); return@post }
+            val accountId = site.accountId
+            val command = InitiatePaymentCommand(
+                accountId, request.email.orEmpty(), billing.currentSiteAmountDue, "KES",
+                request.idempotencyKey ?: UUID.randomUUID().toString(), request.phoneNumber,
+                site.projectId, "Site access: ${site.hostname}", siteId = siteId
+            )
+            paymentService.initiate(paymentProvider, command).fold(
+                onSuccess = { payment ->
+                    call.response.headers.append(io.ktor.http.HttpHeaders.CacheControl, "no-store")
+                    call.respond(HttpStatusCode.Created, PublicSitePaymentResponse.from(payment))
+                },
+                onFailure = { error ->
+                    call.application.environment.log.warn("Public site payment initialization failed for site $siteId: ${error.message}")
+                    call.respond(HttpStatusCode.BadRequest, ApiError("payment_initiation_failed", error.message ?: "Unable to start payment"))
+                }
+            )
+        }
+        get("/api/public/sites/{siteId}/payments/{reference}") {
+            val siteId = runCatching { UUID.fromString(call.parameters["siteId"]) }.getOrNull()
+            val reference = call.parameters["reference"]
+            val payment = reference?.let(store::findByGatewayReference)?.takeIf { it.siteId == siteId && siteId != null }
+            if (payment == null) { call.respond(HttpStatusCode.NotFound, ApiError("payment_not_found", "Payment was not found for this site")); return@get }
+            call.response.headers.append(io.ktor.http.HttpHeaders.CacheControl, "no-store")
+            call.respond(PublicSitePaymentResponse.from(payment, includeCheckoutUrl = false))
         }
         post("/api/auth/login") {
             val request = runCatching { call.receive<LoginRequest>() }.getOrNull()
@@ -584,6 +634,13 @@ fun Application.configurePaymentRoutes() {
                 if (result == EventResult.PROCESSED) nginxQueue.enqueueAll()
             }
             val refreshed = store.findByGatewayReference(reference) ?: payment
+            val siteId = refreshed.siteId
+            val returnSite = siteId?.let(store::findSite)
+            if (returnSite != null) {
+                val encodedReference = java.net.URLEncoder.encode(refreshed.gatewayReference, Charsets.UTF_8)
+                call.respondRedirect("https://${returnSite.hostname}/?gateway_payment=$encodedReference")
+                return@get
+            }
             call.respond(PaymentResponse.from(refreshed))
         }
     }
@@ -631,6 +688,29 @@ private fun redactPayload(provider: String, payload: String): String {
 }
 @Serializable data class CreatedApiKeyResponse(val key: MerchantApiKeyResponse, val secret: String)
 @Serializable data class ApiMessage(val status: String)
+@Serializable data class PublicSitePaymentRequest(val provider: String, val email: String? = null, val phoneNumber: String? = null, val idempotencyKey: String? = null)
+@Serializable data class PublicBillingProjectResponse(val name: String, val status: String, val statusReason: String?, val totalDue: String, val sites: List<PublicBillingSiteSummary>)
+@Serializable data class PublicBillingSiteSummary(val id: String, val hostname: String, val status: String, val amountDue: String)
+@Serializable data class PublicBillingSiteResponse(val id: String, val hostname: String, val status: String, val statusReason: String?, val amountDue: String)
+@Serializable data class PublicSiteBillingResponse(val project: PublicBillingProjectResponse, val site: PublicBillingSiteResponse) {
+    companion object {
+        fun from(billing: com.gateway.payment.domain.PublicProjectBilling) = PublicSiteBillingResponse(
+            PublicBillingProjectResponse(billing.projectName, billing.projectStatus, billing.projectStatusReason, billing.projectTotalDue.toPlainString(), billing.sites.map {
+                PublicBillingSiteSummary(it.siteId.toString(), it.hostname, it.entitlementState, it.amountDue.toPlainString())
+            }),
+            PublicBillingSiteResponse(billing.currentSiteId.toString(), billing.currentSiteHostname, billing.currentSiteState, billing.currentSiteReason, billing.currentSiteAmountDue.toPlainString())
+        )
+    }
+}
+@Serializable data class PublicSitePaymentResponse(val reference: String, val provider: String, val amount: String, val currency: String, val status: String, val checkoutUrl: String? = null) {
+    companion object {
+        fun from(payment: com.gateway.payment.domain.Payment, includeCheckoutUrl: Boolean = true) = PublicSitePaymentResponse(
+            payment.gatewayReference, payment.provider, payment.amount.toPlainString(), payment.currency,
+            if (payment.provider == "initializing") "initializing" else payment.status.name.lowercase(),
+            if (includeCheckoutUrl) payment.checkoutUrl else null
+        )
+    }
+}
 @Serializable data class PaymentResponse(val id: String, val provider: String, val reference: String, val amount: String, val currency: String, val status: String, val checkoutUrl: String?, val projectId: String?, val customerId: String? = null, val customerEmail: String? = null, val customerPhone: String? = null, val description: String? = null, val createdAt: String? = null, val paidAt: String? = null) {
     companion object { fun from(p: com.gateway.payment.domain.Payment) = PaymentResponse(p.id.toString(), p.provider, p.gatewayReference, p.amount.toPlainString(), p.currency, p.status.name.lowercase(), p.checkoutUrl, p.projectId?.toString(), p.customerId?.toString(), p.requestEmail, p.customerPhone, p.description, p.createdAt.toString(), p.paidAt?.toString()) }
 }
@@ -657,12 +737,14 @@ private fun redactPayload(provider: String, payload: String): String {
     val id: String, val hostname: String, val createdAt: String, val projectId: String?, val upstreamUrl: String?, val tlsRef: String?, val template: String,
     val entitlementState: String, val stateReason: String, val stateChangedAt: String?, val stateEffectiveAt: String?,
     val appliedHash: String?, val applyStatus: String, val lastApplyError: String?,
-    val billingAmount: String = "0.00", val manualBlockReason: String? = null
+    val billingAmount: String = "0.00", val manualBlockReason: String? = null,
+    val amountPaid: String = "0.00", val amountDue: String = billingAmount
 ) {
     companion object { fun from(site: PaymentSite) = SiteResponse(
         site.id.toString(), site.hostname, site.createdAt.toString(), site.projectId?.toString(), site.upstreamUrl, site.tlsRef, site.template,
         site.effectiveEntitlementState, site.effectiveStateReason, site.stateChangedAt?.toString(), site.stateEffectiveAt?.toString(),
-        site.appliedHash, site.applyStatus, site.lastApplyError, site.billingAmount.toPlainString(), site.manualBlockReason
+        site.appliedHash, site.applyStatus, site.lastApplyError, site.billingAmount.toPlainString(), site.manualBlockReason,
+        site.amountPaid.toPlainString(), site.amountDue.toPlainString()
     ) }
 }
 @Serializable data class CreateProjectRequest(val name: String, val siteId: String? = null, val billingReference: String? = null)

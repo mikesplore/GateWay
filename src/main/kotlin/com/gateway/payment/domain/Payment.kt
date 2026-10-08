@@ -32,7 +32,8 @@ data class Payment(
     val gatewayReference: String = providerReference,
     val requestEmail: String? = null,
     val description: String? = null,
-    val customerId: UUID? = null
+    val customerId: UUID? = null,
+    val siteId: UUID? = null
 )
 
 data class PaymentEvent(
@@ -74,7 +75,8 @@ data class InitiatePaymentCommand(
     val phoneNumber: String? = null,
     val projectId: UUID? = null,
     val description: String? = null,
-    val gatewayReference: String? = null
+    val gatewayReference: String? = null,
+    val siteId: UUID? = null
 )
 
 data class InitiatedPayment(
@@ -119,6 +121,7 @@ data class PaymentSite(
     val entitlementState: String = "suspended",
     val stateReason: String = "awaiting_payment",
     val billingAmount: BigDecimal = BigDecimal.ZERO,
+    val amountPaid: BigDecimal = BigDecimal.ZERO,
     val manualBlockReason: String? = null,
     val projectStatus: String = "active",
     val projectStatusReason: String? = null,
@@ -128,6 +131,9 @@ data class PaymentSite(
     val applyStatus: String = "not_configured",
     val lastApplyError: String? = null
 ) {
+    val amountDue: BigDecimal
+        get() = (billingAmount - amountPaid).max(BigDecimal.ZERO)
+
     val effectiveEntitlementState: String
         get() = if (projectStatus != "active" || manualBlockReason != null) "suspended" else entitlementState
     val effectiveStateReason: String
@@ -138,3 +144,24 @@ data class PaymentSite(
             else -> stateReason
         }
 }
+
+data class SiteBalance(
+    val siteId: UUID,
+    val hostname: String,
+    val entitlementState: String,
+    val amountDue: BigDecimal
+)
+
+data class PublicProjectBilling(
+    val projectId: UUID,
+    val projectName: String,
+    val projectStatus: String,
+    val projectStatusReason: String?,
+    val currentSiteId: UUID,
+    val currentSiteHostname: String,
+    val currentSiteState: String,
+    val currentSiteReason: String?,
+    val currentSiteAmountDue: BigDecimal,
+    val projectTotalDue: BigDecimal,
+    val sites: List<SiteBalance>
+)
